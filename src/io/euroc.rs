@@ -8,7 +8,8 @@ use opencv::prelude::*;
 use opencv::{imgcodecs, imgcodecs::IMREAD_GRAYSCALE};
 use serde::Deserialize;
 
-use crate::math::{ImuSample, SE3};
+use crate::imu::ImuSample;
+use crate::math::SE3;
 
 #[derive(Debug, Clone)]
 pub struct ImageEntry {

@@ -4,7 +4,121 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a Visual SLAM (Simultaneous Localization and Mapping) implementation in Rust using OpenCV bindings. The project implements computer vision algorithms for tracking camera position and building 3D maps from camera feeds.
+This is a Rust-based implementation of [ORB-SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3), a versatile Visual-Inertial SLAM system. The implementation follows the algorithms described in the [ORB-SLAM3 paper](https://arxiv.org/pdf/2007.11898).
+
+**Target Dataset**: [EuRoC MAV Dataset](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets) - a benchmark for visual-inertial odometry featuring stereo cameras and IMU data collected from a micro aerial vehicle.
+
+**Key Features**:
+- Stereo camera support for depth estimation
+- IMU integration for visual-inertial odometry
+- ORB feature detection and matching
+
+## ORB-SLAM3 Architecture
+
+The system consists of four main components (from Figure 1 of the paper):
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              TRACKING                                        │
+│  ┌───────┐   ┌───────────┐   ┌─────────────────────┐   ┌─────────────────┐  │
+│  │ Frame │──▶│Extract ORB│──▶│ Initial Pose Est.   │──▶│ Track Local Map │  │
+│  └───────┘   └───────────┘   │ (last frame/reloc/  │   └────────┬────────┘  │
+│  ┌───────┐   ┌───────────┐   │  map creation)      │            │           │
+│  │  IMU  │──▶│IMU Integr.│──▶└─────────────────────┘   ┌────────▼────────┐  │
+│  └───────┘   └───────────┘                             │New KF Decision  │  │
+│                                                        └────────┬────────┘  │
+└─────────────────────────────────────────────────────────────────┼───────────┘
+                                                                  │ KeyFrame
+┌─────────────────────────────────────────────────────────────────┼───────────┐
+│                              ATLAS                              │           │
+│  ┌────────────────────┐  ┌─────────────┐  ┌─────────────┐       │           │
+│  │ DBoW2 KEYFRAME DB  │  │ Active Map  │  │Non-active   │       │           │
+│  │ ┌────────────────┐ │  │ ┌─────────┐ │  │   Map       │       │           │
+│  │ │Visual Vocabul. │ │  │ │MapPoints│ │  │ ┌─────────┐ │       │           │
+│  │ └────────────────┘ │  │ ├─────────┤ │  │ │MapPoints│ │       │           │
+│  │ ┌────────────────┐ │  │ │KeyFrames│ │  │ ├─────────┤ │       │           │
+│  │ │Recognition DB  │ │  │ ├─────────┤ │  │ │KeyFrames│ │       │           │
+│  │ └────────────────┘ │  │ │Covisib. │ │  │ ├─────────┤ │       │           │
+│  └────────────────────┘  │ │  Graph  │ │  │ │Covisib. │ │       │           │
+│                          │ ├─────────┤ │  │ │ Graph   │ │       │           │
+│                          │ │Spanning │ │  │ ├─────────┤ │       │           │
+│                          │ │  Tree   │ │  │ │Spanning │ │       │           │
+│                          │ └─────────┘ │  │ │  Tree   │ │       │           │
+│                          └─────────────┘  │ └─────────┘ │       │           │
+│                                           └─────────────┘       │           │
+└─────────────────────────────────────────────────────────────────┼───────────┘
+                                                                  │
+┌────────────────────────────────────────────┐  ┌─────────────────┼───────────┐
+│         LOOP & MAP MERGING                 │  │          LOCAL MAPPING      │
+│  ┌──────────────────────────────────────┐  │  │  ┌─────────────▼─────────┐  │
+│  │ Place Recognition                    │  │  │  │ KeyFrame Insertion    │  │
+│  │  ┌──────────────┐ ┌───────────────┐  │  │  │  ├───────────────────────┤  │
+│  │  │Database Query│ │Compute Sim3/  │  │  │  │  │ Recent MapPts Culling │  │
+│  │  └──────────────┘ │    SE3        │  │  │  │  ├───────────────────────┤  │
+│  │                   └───────────────┘  │  │  │  │ New Points Creation   │  │
+│  └──────────────────────────────────────┘  │  │  ├───────────────────────┤  │
+│  ┌──────────────────────────────────────┐  │  │  │ Local BA              │  │
+│  │ Loop Correction                      │  │  │  ├───────────────────────┤  │
+│  │  ┌───────────┐ ┌───────────────────┐ │  │  │  │ IMU Initialization    │  │
+│  │  │Loop Fusion│ │Optimize Essential │ │  │  │  ├───────────────────────┤  │
+│  │  └───────────┘ │     Graph         │ │  │  │  │ Local KF Culling      │  │
+│  │                └───────────────────┘ │  │  │  ├───────────────────────┤  │
+│  └──────────────────────────────────────┘  │  │  │ IMU Scale Refinement  │  │
+│  ┌──────────────────────────────────────┐  │  │  └───────────────────────┘  │
+│  │ Map Merging                          │  │  └─────────────────────────────┘
+│  │  ┌──────────┐ ┌──────────┐ ┌──────┐  │  │
+│  │  │Merge Maps│ │Welding BA│ │Opt.  │  │  │
+│  │  └──────────┘ └──────────┘ │E.Graph│ │  │
+│  │                            └──────┘  │  │
+│  └──────────────────────────────────────┘  │
+└────────────────────────────────────────────┘
+         │
+         ▼
+┌────────────────────┐
+│      FULL BA       │
+│ ┌────────────────┐ │
+│ │   Map Update   │ │
+│ │   + Full BA    │ │
+│ └────────────────┘ │
+└────────────────────┘
+```
+
+### Implementation Status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **TRACKING** | | |
+| Extract ORB | ✅ Done | `src/frontend/features.rs` |
+| IMU Integration | ✅ Done | `src/math/preintegration.rs` |
+| Initial Pose Estimation | ✅ Done | `src/estimator/vi_estimator.rs` (PnP + IMU prior) |
+| Track Local Map | ❌ Missing | Currently only tracks previous frame |
+| New KeyFrame Decision | ❌ Missing | |
+| **ATLAS** | | |
+| Active Map (MapPoints, KeyFrames) | ❌ Missing | |
+| Covisibility Graph | ❌ Missing | |
+| Spanning Tree | ❌ Missing | |
+| Non-active Maps | ❌ Missing | |
+| DBoW2 Visual Vocabulary | ❌ Missing | |
+| **LOCAL MAPPING** | | |
+| KeyFrame Insertion | ❌ Missing | |
+| MapPoints Culling | ❌ Missing | |
+| New Points Creation | ❌ Missing | |
+| Local Bundle Adjustment | ❌ Missing | |
+| IMU Initialization | ❌ Missing | |
+| IMU Scale Refinement | ❌ Missing | |
+| **LOOP & MAP MERGING** | | |
+| Place Recognition | ❌ Missing | |
+| Loop Fusion | ❌ Missing | |
+| Essential Graph Optimization | ❌ Missing | |
+| Map Merging | ❌ Missing | |
+| **FULL BA** | ❌ Missing | |
+
+## Development Guidelines
+
+- **Plan before implementing**: Always create a todo list before starting work on a feature or fix
+- **Write clean, concise code**: Favor readability and simplicity over cleverness
+- **Avoid over-engineering**: Only implement what's needed for the current task
+- **Follow Rust idioms**: Use proper error handling with `Result`/`Option`, leverage the type system
 
 ## Build Commands
 
@@ -18,67 +132,9 @@ export DYLD_LIBRARY_PATH="$(brew --prefix llvm)/lib:$DYLD_LIBRARY_PATH"
 export PATH="$(brew --prefix llvm)/bin:$PATH"
 ```
 
-### Build & Run
 
-```bash
-# Build the project
-cargo build
+### References
 
-# Build release version
-cargo build --release
-
-# Run the main binary (placeholder)
-cargo run
-
-# Run camera feed test
-cargo run --bin start-camera
-
-# Run feature detection/landmark tracking
-cargo run --bin feature-landmarks
-```
-
-## Project Architecture
-
-### Binary Structure
-
-The project is organized with multiple binaries for different VSLAM components:
-
-- **src/main.rs**: Main entry point (currently a placeholder)
-- **src/bin/start-camera.rs**: Camera initialization and feed display
-- **src/bin/feature-landmarks.rs**: ORB feature detection and keypoint visualization
-
-### VSLAM Pipeline
-
-The codebase implements the "front-end" of a VSLAM system:
-
-1. **Camera Input**: Captures frames from webcam (VideoCapture with device 0)
-2. **Grayscale Conversion**: Converts BGR to grayscale for efficient processing
-3. **Feature Detection**: Uses ORB (Oriented FAST and Rotated BRIEF) detector
-   - Configured to detect up to 1000 keypoints
-   - Uses image pyramid with 8 levels, 1.2 scale factor
-   - HARRIS_SCORE for keypoint scoring
-4. **Visualization**: Draws detected keypoints on the frame in red
-
-### Key Dependencies
-
-- **opencv** (0.98.1): Core computer vision operations, feature detection, camera I/O
-- **nalgebra** (0.34.1): Linear algebra (for future pose estimation and 3D reconstruction)
-- **rerun** (0.28.1): Visualization toolkit (likely for future 3D map visualization)
-- **anyhow** (1.0.100): Error handling
-
-### OpenCV Usage Patterns
-
-All binaries follow a consistent pattern:
-
-1. Initialize camera with `videoio::VideoCapture::new(0, videoio::CAP_ANY)`
-2. Check camera status with `VideoCapture::is_opened()`
-3. Create named window with `highgui::named_window()`
-4. Main loop: read frames, process, display with `highgui::imshow()`
-5. Exit on 'q' key press (ASCII 113)
-
-### Future Architecture Notes
-
-- The nalgebra and rerun dependencies suggest planned features:
-  - Camera pose estimation (using nalgebra for 3D transformations)
-  - 3D map visualization (using rerun for point clouds and trajectories)
-- The "front-end" (feature detection) is implemented; "back-end" (bundle adjustment, loop closure) is not yet present
+- [ORB-SLAM3 Repository](https://github.com/UZ-SLAMLab/ORB_SLAM3)
+- [ORB-SLAM3 Paper](https://arxiv.org/pdf/2007.11898) - Campos et al., "ORB-SLAM3: An Accurate Open-Source Library for Visual, Visual-Inertial and Multi-Map SLAM"
+- [EuRoC MAV Dataset](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets)
