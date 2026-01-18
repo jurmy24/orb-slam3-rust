@@ -89,25 +89,27 @@ The system consists of four main components (from Figure 1 of the paper):
 |-----------|--------|-------|
 | **TRACKING** | | |
 | Extract ORB | ✅ Done | `src/frontend/features.rs` |
-| IMU Integration | ✅ Done | `src/math/preintegration.rs` |
-| Initial Pose Estimation | ✅ Done | `src/estimator/vi_estimator.rs` (PnP + IMU prior) |
-| Track Local Map | ❌ Missing | Currently only tracks previous frame |
-| New KeyFrame Decision | ❌ Missing | |
+| IMU Preintegration | ✅ Done | `src/imu/preintegration.rs` |
+| Initial Pose Estimation | ✅ Done | `src/tracking/tracker.rs` (PnP-RANSAC + motion model) |
+| Track Local Map | ✅ Done | `src/tracking/projection.rs` (projection-based search) |
+| New KeyFrame Decision | ✅ Done | `src/tracking/keyframe_decision.rs` |
+| Tracking State Machine | ✅ Done | `src/tracking/state.rs` (NotInitialized→Ok→RecentlyLost→Lost) |
+| Motion Model | ✅ Done | `src/tracking/motion_model.rs` (velocity-based prediction) |
 | **ATLAS** | | |
-| Active Map (MapPoints, KeyFrames) | ❌ Missing | |
-| Covisibility Graph | ❌ Missing | |
-| Spanning Tree | ❌ Missing | |
-| Non-active Maps | ❌ Missing | |
+| Active Map (MapPoints, KeyFrames) | ✅ Done | `src/atlas/map/map.rs`, `src/atlas/map/keyframe.rs`, `src/atlas/map/map_point.rs` |
+| Covisibility Graph | ✅ Done | `src/atlas/map/keyframe.rs` (shared map point counting) |
+| Spanning Tree | ✅ Done | `src/atlas/map/keyframe.rs` (parent/children relationships) |
+| Non-active Maps | ❌ Missing | Only single active map currently |
 | DBoW2 Visual Vocabulary | ❌ Missing | |
 | **LOCAL MAPPING** | | |
-| KeyFrame Insertion | ❌ Missing | |
-| MapPoints Culling | ❌ Missing | |
-| New Points Creation | ❌ Missing | |
+| KeyFrame Insertion | ❌ Missing | Need to integrate with `src/atlas/map/` |
+| MapPoints Culling | ✅ Done | `src/atlas/map/map.rs` (`cull_bad_map_points`) |
+| New Points Creation | ✅ Done | `src/tracking/tracker.rs` (`create_map_points_from_stereo`) |
 | Local Bundle Adjustment | ❌ Missing | |
-| IMU Initialization | ❌ Missing | |
-| IMU Scale Refinement | ❌ Missing | |
+| IMU Initialization | ✅ Done | `src/imu/vi_initializer.rs` (ORB-SLAM3 joint VI init) |
+| IMU Scale Refinement | ⚠️ Partial | Initial scale estimated during VI init |
 | **LOOP & MAP MERGING** | | |
-| Place Recognition | ❌ Missing | |
+| Place Recognition | ❌ Missing | Requires DBoW2 |
 | Loop Fusion | ❌ Missing | |
 | Essential Graph Optimization | ❌ Missing | |
 | Map Merging | ❌ Missing | |
@@ -119,6 +121,7 @@ The system consists of four main components (from Figure 1 of the paper):
 - **Write clean, concise code**: Favor readability and simplicity over cleverness
 - **Avoid over-engineering**: Only implement what's needed for the current task
 - **Follow Rust idioms**: Use proper error handling with `Result`/`Option`, leverage the type system
+- Update your progress in this file when done.
 
 ## Build Commands
 

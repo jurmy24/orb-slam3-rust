@@ -1,3 +1,4 @@
+pub mod atlas;
 pub mod estimator;
 pub mod frontend;
 pub mod imu;
