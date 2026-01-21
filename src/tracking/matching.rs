@@ -1,10 +1,12 @@
+//! Temporal feature matching between consecutive frames.
+
 use anyhow::Result;
 use nalgebra::Vector3;
 use opencv::core::{DMatch, Mat, Vector};
 use opencv::features2d::BFMatcher;
 use opencv::prelude::*;
 
-use crate::frontend::features::FeatureSet;
+use crate::tracking::frame::features::FeatureSet;
 
 pub struct TemporalMatcher {
     matcher: BFMatcher,

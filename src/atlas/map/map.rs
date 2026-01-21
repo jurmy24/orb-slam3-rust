@@ -17,8 +17,8 @@ use std::collections::{HashMap, HashSet};
 use nalgebra::Vector3;
 use opencv::core::{KeyPoint, Mat, Vector};
 
-use crate::frontend::camera::CameraModel;
-use crate::math::SE3;
+use crate::geometry::SE3;
+use crate::tracking::frame::CameraModel;
 
 use super::keyframe::KeyFrame;
 use super::map_point::MapPoint;
@@ -47,6 +47,7 @@ pub struct Map {
 
 impl Map {
     /// Create a new empty Map.
+    // ! Some parameters set here too
     pub fn new() -> Self {
         Self {
             keyframes: HashMap::new(),
@@ -285,10 +286,7 @@ impl Map {
     /// Returns the MapPoint ID that was disassociated, if any.
     pub fn disassociate(&mut self, kf_id: KeyFrameId, feature_idx: usize) -> Option<MapPointId> {
         // Get the MapPoint ID
-        let mp_id = self
-            .keyframes
-            .get(&kf_id)?
-            .get_map_point(feature_idx)?;
+        let mp_id = self.keyframes.get(&kf_id)?.get_map_point(feature_idx)?;
 
         // Get other observers for covisibility update
         let other_observers: Vec<KeyFrameId> = self
@@ -361,10 +359,7 @@ impl Map {
     }
 
     /// Get all MapPoints observed by a set of KeyFrames.
-    pub fn get_map_points_from_keyframes(
-        &self,
-        kf_ids: &[KeyFrameId],
-    ) -> HashSet<MapPointId> {
+    pub fn get_map_points_from_keyframes(&self, kf_ids: &[KeyFrameId]) -> HashSet<MapPointId> {
         let mut mp_ids = HashSet::new();
 
         for &kf_id in kf_ids {
@@ -461,11 +456,7 @@ impl Map {
     /// * `min_observations` - Minimum number of observing KeyFrames (typically 3)
     ///
     /// Returns the number of culled MapPoints.
-    pub fn cull_bad_map_points(
-        &mut self,
-        min_found_ratio: f64,
-        min_observations: usize,
-    ) -> usize {
+    pub fn cull_bad_map_points(&mut self, min_found_ratio: f64, min_observations: usize) -> usize {
         // Find MapPoints to cull
         let to_cull: Vec<MapPointId> = self
             .map_points
@@ -676,19 +667,9 @@ mod tests {
     fn test_create_map_point() {
         let mut map = create_test_map();
 
-        let kf_id = map.create_keyframe(
-            0,
-            SE3::identity(),
-            Vector::new(),
-            Mat::default(),
-            vec![],
-        );
+        let kf_id = map.create_keyframe(0, SE3::identity(), Vector::new(), Mat::default(), vec![]);
 
-        let mp_id = map.create_map_point(
-            Vector3::new(1.0, 2.0, 3.0),
-            Mat::default(),
-            kf_id,
-        );
+        let mp_id = map.create_map_point(Vector3::new(1.0, 2.0, 3.0), Mat::default(), kf_id);
 
         assert_eq!(mp_id, MapPointId::new(0));
         assert_eq!(map.num_map_points(), 1);
@@ -718,11 +699,7 @@ mod tests {
         );
 
         // Create a MapPoint
-        let mp_id = map.create_map_point(
-            Vector3::new(1.0, 0.0, 5.0),
-            Mat::default(),
-            kf1_id,
-        );
+        let mp_id = map.create_map_point(Vector3::new(1.0, 0.0, 5.0), Mat::default(), kf1_id);
 
         // Associate both KeyFrames with the MapPoint
         assert!(map.associate(kf1_id, 0, mp_id));
@@ -735,8 +712,14 @@ mod tests {
         assert_eq!(mp.observations.get(&kf2_id), Some(&3));
 
         // Check KeyFrames point to MapPoint
-        assert_eq!(map.get_keyframe(kf1_id).unwrap().get_map_point(0), Some(mp_id));
-        assert_eq!(map.get_keyframe(kf2_id).unwrap().get_map_point(3), Some(mp_id));
+        assert_eq!(
+            map.get_keyframe(kf1_id).unwrap().get_map_point(0),
+            Some(mp_id)
+        );
+        assert_eq!(
+            map.get_keyframe(kf2_id).unwrap().get_map_point(3),
+            Some(mp_id)
+        );
 
         // Check covisibility was updated
         let kf1 = map.get_keyframe(kf1_id).unwrap();
@@ -772,7 +755,9 @@ mod tests {
 
         // Covisibility should be 1
         assert_eq!(
-            map.get_keyframe(kf1_id).unwrap().get_covisibility_weight(kf2_id),
+            map.get_keyframe(kf1_id)
+                .unwrap()
+                .get_covisibility_weight(kf2_id),
             1
         );
 
@@ -790,7 +775,9 @@ mod tests {
 
         // Covisibility should be removed (was 1, now 0)
         assert_eq!(
-            map.get_keyframe(kf1_id).unwrap().get_covisibility_weight(kf2_id),
+            map.get_keyframe(kf1_id)
+                .unwrap()
+                .get_covisibility_weight(kf2_id),
             0
         );
     }
@@ -840,10 +827,34 @@ mod tests {
         let mut map = create_test_map();
 
         // Create KeyFrames with varying covisibility
-        let kf0_id = map.create_keyframe(0, SE3::identity(), Vector::new(), Mat::default(), vec![None; 10]);
-        let kf1_id = map.create_keyframe(1, SE3::identity(), Vector::new(), Mat::default(), vec![None; 10]);
-        let kf2_id = map.create_keyframe(2, SE3::identity(), Vector::new(), Mat::default(), vec![None; 10]);
-        let kf3_id = map.create_keyframe(3, SE3::identity(), Vector::new(), Mat::default(), vec![None; 10]);
+        let kf0_id = map.create_keyframe(
+            0,
+            SE3::identity(),
+            Vector::new(),
+            Mat::default(),
+            vec![None; 10],
+        );
+        let kf1_id = map.create_keyframe(
+            1,
+            SE3::identity(),
+            Vector::new(),
+            Mat::default(),
+            vec![None; 10],
+        );
+        let kf2_id = map.create_keyframe(
+            2,
+            SE3::identity(),
+            Vector::new(),
+            Mat::default(),
+            vec![None; 10],
+        );
+        let kf3_id = map.create_keyframe(
+            3,
+            SE3::identity(),
+            Vector::new(),
+            Mat::default(),
+            vec![None; 10],
+        );
 
         // Create MapPoints and associations to build covisibility
         // kf0 shares 3 points with kf1, 1 point with kf2, 2 points with kf3

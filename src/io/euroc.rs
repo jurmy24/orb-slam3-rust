@@ -8,8 +8,8 @@ use opencv::prelude::*;
 use opencv::{imgcodecs, imgcodecs::IMREAD_GRAYSCALE};
 use serde::Deserialize;
 
+use crate::geometry::SE3;
 use crate::imu::ImuSample;
-use crate::math::SE3;
 
 #[derive(Debug, Clone)]
 pub struct ImageEntry {
@@ -215,9 +215,10 @@ fn load_stereo_calibration(root: &Path) -> Result<StereoCalibration> {
     let t_cam1_body = transform_from(&cam1.t_bs.data)?;
 
     // Transform from cam0 to cam1: T_c1_c0 = T_c1_b * T_b_c0
+    // TODO: Double check this is correct, especially the baseline calculation
     let t_cam0_body_inv = t_cam0_body.inverse();
     let t_cam1_cam0 = t_cam1_body.compose(&t_cam0_body_inv);
-    let baseline = t_cam1_cam0.translation.x.abs();
+    let baseline = t_cam1_cam0.translation.norm();
 
     Ok(StereoCalibration {
         k_left,
@@ -229,7 +230,10 @@ fn load_stereo_calibration(root: &Path) -> Result<StereoCalibration> {
     })
 }
 
-/// Convert EuRoC intrinsics [fx, fy, cx, cy] to 3x3 camera matrix
+/// Convert EuRoC intrinsics [fx, fy, cx, cy] to 3x3 camera matrix (K-matrix for pinhole cameras)
+/// For a 3D point in camera coordinates (x, y, z), you normalize it by dividing x, y, and z by z
+/// and then apply K (u, v, 1) = K(x/z, y/z, 1) to get the 2D pixel coordinates (u, v)
+/// This is what the K-matrix is used for
 fn intrinsics_to_matrix3(intrinsics: &[f64]) -> Result<Matrix3<f64>> {
     if intrinsics.len() != 4 {
         bail!(

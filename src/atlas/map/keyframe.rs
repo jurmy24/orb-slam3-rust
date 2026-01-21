@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 use nalgebra::Vector3;
 use opencv::core::{KeyPoint, Mat, Vector};
 
+use crate::geometry::SE3;
 use crate::imu::{ImuBias, PreintegratedState};
-use crate::math::SE3;
 
 use super::types::{KeyFrameId, MapPointId};
 
@@ -51,6 +51,12 @@ pub struct KeyFrame {
     /// 3D points in camera frame (from stereo triangulation).
     /// None if the point couldn't be triangulated (e.g., too far, poor disparity).
     pub points_cam: Vec<Option<Vector3<f64>>>,
+
+    /// Optional Bag-of-Words representation used for place recognition.
+    ///
+    /// The vocabulary and BoW computation live outside of this type; the
+    /// KeyFrame simply stores the resulting sparse histogram.
+    pub bow_vector: Option<crate::atlas::keyframe_db::BowVector>,
 
     // ─────────────────────────────────────────────────────────────────────────
     // Map Associations
@@ -133,6 +139,7 @@ impl KeyFrame {
             map_point_ids: vec![None; num_features],
             imu_preintegrated: None,
             imu_bias: ImuBias::zero(),
+            bow_vector: None,
             covisibility_weights: HashMap::new(),
             ordered_covisibles: Vec::new(),
             covisibility_dirty: false,
@@ -155,6 +162,23 @@ impl KeyFrame {
     /// Get the world-to-camera transform (inverse of pose).
     pub fn pose_wc_inverse(&self) -> SE3 {
         self.pose.inverse()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Bag-of-Words accessors
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Set the Bag-of-Words vector for this keyframe.
+    ///
+    /// The caller is responsible for computing the BoW representation using
+    /// a vocabulary. This method simply stores the resulting sparse vector.
+    pub fn set_bow_vector(&mut self, bow: crate::atlas::keyframe_db::BowVector) {
+        self.bow_vector = Some(bow);
+    }
+
+    /// Get a reference to the Bag-of-Words vector, if available.
+    pub fn bow_vector(&self) -> Option<&crate::atlas::keyframe_db::BowVector> {
+        self.bow_vector.as_ref()
     }
 
     // ─────────────────────────────────────────────────────────────────────────

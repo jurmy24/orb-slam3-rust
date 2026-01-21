@@ -3,13 +3,9 @@
 //! Entity hierarchy:
 //!     camera/
 //!         left/
-//!             image       - Rectified left image
-//!             features    - All detected features (green)
-//!             matched     - Matched features (red)
-//!         right/
-//!             image       - Rectified right image
-//!             features    - All detected features (green)
-//!             matched     - Matched features (red)
+//!             image/              - Rectified left image
+//!                 unmatched       - Unmatched features (green, radius 6.0)
+//!                 matched         - Matched features (red, radius 10.0)
 //!     world/
 //!         camera      - Camera pose transform
 //!         trajectory  - Camera trajectory line
@@ -20,8 +16,11 @@ use opencv::core::{DMatch, KeyPoint, Mat, Vector};
 use opencv::prelude::*;
 use rerun::{RecordingStream, external::glam};
 
-use crate::frontend::stereo::StereoFrame;
-use crate::math::SE3;
+use crate::atlas::map::KeyFrame;
+use crate::geometry::SE3;
+use crate::tracking::TrackingState;
+use crate::tracking::frame::StereoFrame;
+use crate::tracking::result::{TimingStats, TrackingMetrics};
 
 pub struct RerunVisualizer {
     rec: RecordingStream,
@@ -33,7 +32,7 @@ impl RerunVisualizer {
             .spawn()
             .expect("Failed to spawn rerun viewer");
 
-        // Set up coordinate system (Right-Down-Forward, typical camera convention)
+        // Set up coordinate system (Right-Down-Forward, typical camera convention) for the world frame
         rec.log_static("world", &rerun::ViewCoordinates::RDF()).ok();
 
         Self { rec }
@@ -49,11 +48,7 @@ impl RerunVisualizer {
     pub fn log_stereo_frame(&self, frame: &StereoFrame, left_image: &Mat, right_image: &Mat) {
         self.set_time(frame.timestamp_ns);
         self.log_images(left_image, right_image);
-        self.log_features(
-            &frame.left_features.keypoints,
-            &frame.right_features.keypoints,
-        );
-        self.log_matches(
+        self.log_features_and_matches(
             &frame.left_features.keypoints,
             &frame.right_features.keypoints,
             &frame.matches_lr,
@@ -61,8 +56,8 @@ impl RerunVisualizer {
         self.log_3d_points_from_frame(frame);
     }
 
-    fn log_images(&self, left: &Mat, right: &Mat) {
-        // Convert Mat to image data
+    fn log_images(&self, left: &Mat, _right: &Mat) {
+        // Convert Mat to image data (only log left image)
         if let Ok((data, width, height)) = mat_to_image_data(left) {
             self.rec
                 .log(
@@ -71,87 +66,52 @@ impl RerunVisualizer {
                 )
                 .ok();
         }
-        if let Ok((data, width, height)) = mat_to_image_data(right) {
-            self.rec
-                .log(
-                    "camera/right/image",
-                    &rerun::Image::from_l8(data, [width, height]),
-                )
-                .ok();
-        }
     }
 
-    fn log_features(&self, left_kps: &Vector<KeyPoint>, right_kps: &Vector<KeyPoint>) {
-        // Left image features (green)
-        let left_pts: Vec<[f32; 2]> = left_kps.iter().map(|kp| [kp.pt().x, kp.pt().y]).collect();
-        if !left_pts.is_empty() {
-            self.rec
-                .log(
-                    "camera/left/features",
-                    &rerun::Points2D::new(left_pts)
-                        .with_colors([[0u8, 255, 0]]) // Green
-                        .with_radii([3.0f32]),
-                )
-                .ok();
-        }
-
-        // Right image features (green)
-        let right_pts: Vec<[f32; 2]> = right_kps.iter().map(|kp| [kp.pt().x, kp.pt().y]).collect();
-        if !right_pts.is_empty() {
-            self.rec
-                .log(
-                    "camera/right/features",
-                    &rerun::Points2D::new(right_pts)
-                        .with_colors([[0u8, 255, 0]]) // Green
-                        .with_radii([3.0f32]),
-                )
-                .ok();
-        }
-    }
-
-    fn log_matches(
+    fn log_features_and_matches(
         &self,
         left_kps: &Vector<KeyPoint>,
-        right_kps: &Vector<KeyPoint>,
+        _right_kps: &Vector<KeyPoint>,
         matches: &Vector<DMatch>,
     ) {
-        if matches.is_empty() {
-            return;
+        // Build set of matched indices
+        let mut matched_indices = std::collections::HashSet::new();
+        for m in matches.iter() {
+            matched_indices.insert(m.query_idx as usize);
         }
 
-        let mut left_matched: Vec<[f32; 2]> = Vec::new();
-        let mut right_matched: Vec<[f32; 2]> = Vec::new();
+        let mut unmatched_pts: Vec<[f32; 2]> = Vec::new();
+        let mut matched_pts: Vec<[f32; 2]> = Vec::new();
 
-        for m in matches.iter() {
-            if let (Ok(lkp), Ok(rkp)) = (
-                left_kps.get(m.query_idx as usize),
-                right_kps.get(m.train_idx as usize),
-            ) {
-                left_matched.push([lkp.pt().x, lkp.pt().y]);
-                right_matched.push([rkp.pt().x, rkp.pt().y]);
+        for (idx, kp) in left_kps.iter().enumerate() {
+            let pt = [kp.pt().x, kp.pt().y];
+            if matched_indices.contains(&idx) {
+                matched_pts.push(pt);
+            } else {
+                unmatched_pts.push(pt);
             }
         }
 
-        // Matched points in left image (red)
-        if !left_matched.is_empty() {
+        // Log unmatched features (green) - smaller
+        if !unmatched_pts.is_empty() {
             self.rec
                 .log(
-                    "camera/left/matched",
-                    &rerun::Points2D::new(left_matched)
-                        .with_colors([[255u8, 0, 0]]) // Red
-                        .with_radii([4.0f32]),
+                    "camera/left/image/unmatched",
+                    &rerun::Points2D::new(unmatched_pts)
+                        .with_colors([[0u8, 255, 0]]) // Green
+                        .with_radii([6.0f32]),
                 )
                 .ok();
         }
 
-        // Matched points in right image (red)
-        if !right_matched.is_empty() {
+        // Log matched features (red) - larger
+        if !matched_pts.is_empty() {
             self.rec
                 .log(
-                    "camera/right/matched",
-                    &rerun::Points2D::new(right_matched)
+                    "camera/left/image/matched",
+                    &rerun::Points2D::new(matched_pts)
                         .with_colors([[255u8, 0, 0]]) // Red
-                        .with_radii([4.0f32]),
+                        .with_radii([10.0f32]),
                 )
                 .ok();
         }
@@ -274,6 +234,223 @@ impl RerunVisualizer {
                 &rerun::Points3D::new(pts)
                     .with_colors([[0u8, 200, 255]])
                     .with_radii([0.03f32]),
+            )
+            .ok();
+    }
+
+    /// Log scalar tracking state and emit a textual event.
+    pub fn log_tracking_state(&self, state: TrackingState, frame_idx: usize, map_index: usize) {
+        let code = match state {
+            TrackingState::NotInitialized => 0,
+            TrackingState::Ok => 1,
+            TrackingState::RecentlyLost => 2,
+            TrackingState::Lost => 3,
+        };
+        self.rec
+            .log("metrics/state", &rerun::Scalars::single(code as f64))
+            .ok();
+
+        let msg = format!("frame={} map={} state={:?}", frame_idx, map_index, state);
+        self.log_event("tracking", &msg);
+    }
+
+    /// Log scalar tracking metrics as simple time series.
+    pub fn log_tracking_metrics(&self, metrics: &TrackingMetrics) {
+        self.rec
+            .log(
+                "metrics/n_features",
+                &rerun::Scalars::single(metrics.n_features as f64),
+            )
+            .ok();
+        self.rec
+            .log(
+                "metrics/n_matches",
+                &rerun::Scalars::single(metrics.n_map_point_matches as f64),
+            )
+            .ok();
+        self.rec
+            .log(
+                "metrics/n_inliers",
+                &rerun::Scalars::single(metrics.n_inliers as f64),
+            )
+            .ok();
+        self.rec
+            .log(
+                "metrics/inlier_ratio",
+                &rerun::Scalars::single(metrics.inlier_ratio),
+            )
+            .ok();
+        self.rec
+            .log(
+                "metrics/reproj_err_median",
+                &rerun::Scalars::single(metrics.reproj_error_median_px),
+            )
+            .ok();
+        self.rec
+            .log(
+                "metrics/delta_trans",
+                &rerun::Scalars::single(metrics.delta_translation_m),
+            )
+            .ok();
+        self.rec
+            .log(
+                "metrics/delta_rot",
+                &rerun::Scalars::single(metrics.delta_rotation_deg),
+            )
+            .ok();
+    }
+
+    /// Log per-stage timing information.
+    pub fn log_timing(&self, timing: &TimingStats) {
+        self.rec
+            .log(
+                "metrics/timing/total_ms",
+                &rerun::Scalars::single(timing.total_ms),
+            )
+            .ok();
+        self.rec
+            .log(
+                "metrics/timing/extract_orb_ms",
+                &rerun::Scalars::single(timing.extract_orb_ms),
+            )
+            .ok();
+        self.rec
+            .log(
+                "metrics/timing/match_ms",
+                &rerun::Scalars::single(timing.match_ms),
+            )
+            .ok();
+        self.rec
+            .log(
+                "metrics/timing/solve_pnp_ms",
+                &rerun::Scalars::single(timing.solve_pnp_ms),
+            )
+            .ok();
+        self.rec
+            .log(
+                "metrics/timing/relocal_ms",
+                &rerun::Scalars::single(timing.relocal_ms),
+            )
+            .ok();
+    }
+
+    /// Log a simple text event (e.g. LOST / RELOCALIZED).
+    pub fn log_event(&self, category: &str, message: &str) {
+        let full_msg = format!("[{}] {}", category, message);
+        self.rec
+            .log("events/log", &rerun::TextLog::new(full_msg))
+            .ok();
+    }
+
+    /// Log features that were used for pose estimation.
+    pub fn log_features_used(&self, points: &[[f32; 2]]) {
+        if points.is_empty() {
+            return;
+        }
+        self.rec
+            .log(
+                "camera/left/features_used",
+                &rerun::Points2D::new(points.to_vec())
+                    .with_colors([[0u8, 0, 255]]) // Blue
+                    .with_radii([4.0f32]),
+            )
+            .ok();
+    }
+
+    /// Log inlier vs outlier feature locations in the left image.
+    pub fn log_inliers_outliers(&self, inliers: &[[f32; 2]], outliers: &[[f32; 2]]) {
+        if !inliers.is_empty() {
+            self.rec
+                .log(
+                    "camera/left/inliers",
+                    &rerun::Points2D::new(inliers.to_vec())
+                        .with_colors([[0u8, 255, 0]]) // Green
+                        .with_radii([4.0f32]),
+                )
+                .ok();
+        }
+        if !outliers.is_empty() {
+            self.rec
+                .log(
+                    "camera/left/outliers",
+                    &rerun::Points2D::new(outliers.to_vec())
+                        .with_colors([[255u8, 0, 0]]) // Red
+                        .with_radii([3.0f32]),
+                )
+                .ok();
+        }
+    }
+
+    /// Log reprojection error as radius of points in the left image.
+    pub fn log_reproj_errors(&self, points: &[[f32; 2]], errors: &[f64]) {
+        if points.is_empty() || points.len() != errors.len() {
+            return;
+        }
+        let radii: Vec<f32> = errors.iter().map(|e| (1.0 + e.min(10.0)) as f32).collect();
+        self.rec
+            .log(
+                "camera/left/reproj_error",
+                &rerun::Points2D::new(points.to_vec()).with_radii(radii),
+            )
+            .ok();
+    }
+
+    /// Log keyframe frustums as camera transforms in world space.
+    pub fn log_keyframe_frustums(&self, keyframes: &[&KeyFrame]) {
+        for kf in keyframes {
+            let t = &kf.pose.translation;
+            let q = &kf.pose.rotation;
+            let translation = glam::Vec3::new(t.x as f32, t.y as f32, t.z as f32);
+            let rotation = glam::Quat::from_xyzw(
+                q.coords.x as f32,
+                q.coords.y as f32,
+                q.coords.z as f32,
+                q.w as f32,
+            );
+            let path = format!("world/keyframes/{}", kf.id.0);
+            self.rec
+                .log(
+                    path,
+                    &rerun::Transform3D::from_translation_rotation(translation, rotation),
+                )
+                .ok();
+        }
+    }
+
+    /// Log local map points for the current frame.
+    pub fn log_local_map_points(&self, points: &[Vector3<f64>]) {
+        if points.is_empty() {
+            return;
+        }
+        let pts: Vec<[f32; 3]> = points
+            .iter()
+            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
+            .collect();
+        self.rec
+            .log(
+                "world/local_points",
+                &rerun::Points3D::new(pts)
+                    .with_colors([[0u8, 255, 255]])
+                    .with_radii([0.03f32]),
+            )
+            .ok();
+    }
+
+    /// Log inlier map points for the current frame.
+    pub fn log_inlier_map_points(&self, points: &[Vector3<f64>]) {
+        if points.is_empty() {
+            return;
+        }
+        let pts: Vec<[f32; 3]> = points
+            .iter()
+            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
+            .collect();
+        self.rec
+            .log(
+                "world/inlier_points",
+                &rerun::Points3D::new(pts)
+                    .with_colors([[0u8, 255, 0]])
+                    .with_radii([0.035f32]),
             )
             .ok();
     }

@@ -19,6 +19,8 @@
 //! - `atlas` - Full Atlas container with active/non-active map switching
 
 pub mod map;
+pub mod atlas;
+pub mod keyframe_db;
 
 // Re-export commonly used types
 pub use map::{KeyFrame, KeyFrameId, Map, MapPoint, MapPointId};

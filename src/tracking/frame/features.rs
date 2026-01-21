@@ -15,6 +15,7 @@ pub struct FeatureDetector {
 }
 
 impl FeatureDetector {
+    // ! Parameters are set here
     pub fn new(n_features: i32) -> Result<Self> {
         let orb = features2d::ORB::create(
             n_features,
@@ -43,7 +44,7 @@ impl FeatureDetector {
     }
 }
 
-/// Convert OpenCV keypoints to (x, y) points.
+/// Convert OpenCV keypoints to (x, y) points in pixel coordinates (image frame)
 pub fn keypoints_to_points(keypoints: &Vector<KeyPoint>) -> Vec<Point2<f64>> {
     keypoints
         .iter()
