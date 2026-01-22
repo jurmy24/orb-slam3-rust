@@ -53,12 +53,15 @@ pub fn solve_pnp_ransac(
     let mut use_extrinsic_guess = false;
 
     if let Some(prior_pose) = prior {
-        let rot_mat = prior_pose.rotation.to_rotation_matrix().into_inner();
+        // OpenCV expects T_cw (world-to-camera), but our poses are T_wc (camera-to-world)
+        // So we need to invert the prior before passing to OpenCV
+        let prior_cw = prior_pose.inverse();
+        let rot_mat = prior_cw.rotation.to_rotation_matrix().into_inner();
         rvec = rotation_matrix_to_rvec(rot_mat)?;
         tvec = Mat::from_slice(&[
-            prior_pose.translation.x,
-            prior_pose.translation.y,
-            prior_pose.translation.z,
+            prior_cw.translation.x,
+            prior_cw.translation.y,
+            prior_cw.translation.z,
         ])?
         .try_clone()?;
         use_extrinsic_guess = !rvec.empty();
@@ -89,7 +92,10 @@ pub fn solve_pnp_ransac(
         *tvec.at::<f64>(2i32)?,
     );
 
-    Ok(SE3::from_rt(rotation, translation))
+    // OpenCV returns T_cw (world-to-camera), but our convention is T_wc (camera-to-world)
+    // So we need to invert the result
+    let pose_cw = SE3::from_rt(rotation, translation);
+    Ok(pose_cw.inverse())
 }
 
 /// Solve PnP with RANSAC and also return inlier mask and reprojection errors.

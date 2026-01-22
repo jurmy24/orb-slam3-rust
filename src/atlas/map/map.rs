@@ -43,6 +43,19 @@ pub struct Map {
 
     /// Number of ORB pyramid levels (typically 8).
     orb_num_levels: u32,
+
+    /// Whether IMU has been initialized for this map.
+    imu_initialized: bool,
+
+    /// Whether first visual-inertial BA has been done.
+    inertial_ba1_done: bool,
+
+    /// Whether second visual-inertial BA has been done.
+    inertial_ba2_done: bool,
+
+    /// Most recent KeyFrame ID (tail of temporal chain).
+    /// Used to link new keyframes in temporal order.
+    last_keyframe_id: Option<KeyFrameId>,
 }
 
 impl Map {
@@ -56,6 +69,10 @@ impl Map {
             next_mp_id: 0,
             orb_scale_factor: 1.2,
             orb_num_levels: 8,
+            imu_initialized: false,
+            inertial_ba1_done: false,
+            inertial_ba2_done: false,
+            last_keyframe_id: None,
         }
     }
 
@@ -66,6 +83,40 @@ impl Map {
             orb_num_levels: num_levels,
             ..Self::new()
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // IMU Initialization State
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Check if IMU has been initialized for this map.
+    pub fn is_imu_initialized(&self) -> bool {
+        self.imu_initialized
+    }
+
+    /// Set IMU as initialized.
+    pub fn set_imu_initialized(&mut self) {
+        self.imu_initialized = true;
+    }
+
+    /// Check if first visual-inertial BA has been done.
+    pub fn is_inertial_ba1_done(&self) -> bool {
+        self.inertial_ba1_done
+    }
+
+    /// Set first visual-inertial BA as done.
+    pub fn set_inertial_ba1_done(&mut self) {
+        self.inertial_ba1_done = true;
+    }
+
+    /// Check if second visual-inertial BA has been done.
+    pub fn is_inertial_ba2_done(&self) -> bool {
+        self.inertial_ba2_done
+    }
+
+    /// Set second visual-inertial BA as done.
+    pub fn set_inertial_ba2_done(&mut self) {
+        self.inertial_ba2_done = true;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -92,6 +143,7 @@ impl Map {
 
     /// Create and add a new KeyFrame to the map.
     ///
+    /// Automatically links the new keyframe to the previous one in temporal order.
     /// Returns the ID of the created KeyFrame.
     pub fn create_keyframe(
         &mut self,
@@ -102,9 +154,54 @@ impl Map {
         points_cam: Vec<Option<Vector3<f64>>>,
     ) -> KeyFrameId {
         let id = self.next_keyframe_id();
-        let kf = KeyFrame::new(id, timestamp_ns, pose, keypoints, descriptors, points_cam);
+        let mut kf = KeyFrame::new(id, timestamp_ns, pose, keypoints, descriptors, points_cam);
+
+        // Link to previous keyframe in temporal chain
+        if let Some(prev_id) = self.last_keyframe_id {
+            kf.prev_kf = Some(prev_id);
+            // Update the previous keyframe's next_kf pointer
+            if let Some(prev_kf) = self.keyframes.get_mut(&prev_id) {
+                prev_kf.next_kf = Some(id);
+            }
+        }
+
         self.keyframes.insert(id, kf);
+        self.last_keyframe_id = Some(id);
         id
+    }
+
+    /// Get the most recent KeyFrame ID.
+    pub fn last_keyframe_id(&self) -> Option<KeyFrameId> {
+        self.last_keyframe_id
+    }
+
+    /// Get keyframes in temporal order (oldest to newest).
+    ///
+    /// Walks the temporal chain from the first keyframe with no prev_kf.
+    pub fn keyframes_temporal_order(&self) -> Vec<&KeyFrame> {
+        // Find the first keyframe (no prev_kf)
+        let first_kf = self.keyframes.values().find(|kf| kf.prev_kf.is_none());
+
+        let mut result = Vec::new();
+        let mut current = first_kf;
+
+        while let Some(kf) = current {
+            result.push(kf);
+            current = kf.next_kf.and_then(|id| self.keyframes.get(&id));
+        }
+
+        result
+    }
+
+    /// Get the timestamp span of the map in seconds.
+    pub fn time_span_seconds(&self) -> f64 {
+        let kfs = self.keyframes_temporal_order();
+        if kfs.len() < 2 {
+            return 0.0;
+        }
+        let first_ts = kfs.first().unwrap().timestamp_ns as f64 / 1e9;
+        let last_ts = kfs.last().unwrap().timestamp_ns as f64 / 1e9;
+        last_ts - first_ts
     }
 
     /// Add an existing KeyFrame to the map.

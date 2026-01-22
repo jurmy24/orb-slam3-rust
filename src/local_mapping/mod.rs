@@ -6,7 +6,10 @@
 //! - Maintaining the covisibility graph
 //! - Running local bundle adjustment (deferred)
 //! - Culling redundant keyframes and map points (deferred)
+//! - IMU initialization (for visual-inertial mode)
 
+pub mod imu_init;
 mod local_mapper;
 
+pub use imu_init::{apply_imu_init, initialize_imu, ImuInitResult};
 pub use local_mapper::LocalMapper;

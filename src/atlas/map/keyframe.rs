@@ -76,6 +76,17 @@ pub struct KeyFrame {
     pub imu_bias: ImuBias,
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Temporal Links (for IMU)
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Previous KeyFrame in temporal order (for IMU preintegration chain).
+    /// None for the first KeyFrame in the map.
+    pub prev_kf: Option<KeyFrameId>,
+
+    /// Next KeyFrame in temporal order.
+    /// None for the most recent KeyFrame.
+    pub next_kf: Option<KeyFrameId>,
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Covisibility Graph
     // ─────────────────────────────────────────────────────────────────────────
     /// Covisibility weights: connected KeyFrame → number of shared MapPoints.
@@ -139,6 +150,8 @@ impl KeyFrame {
             map_point_ids: vec![None; num_features],
             imu_preintegrated: None,
             imu_bias: ImuBias::zero(),
+            prev_kf: None,
+            next_kf: None,
             bow_vector: None,
             covisibility_weights: HashMap::new(),
             ordered_covisibles: Vec::new(),
@@ -305,8 +318,7 @@ impl KeyFrame {
             .iter()
             .map(|(id, w)| (*id, *w))
             .collect();
-        self.ordered_covisibles
-            .sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by weight
+        self.ordered_covisibles.sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by weight
         self.covisibility_dirty = false;
     }
 

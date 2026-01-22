@@ -85,6 +85,14 @@ impl Atlas {
         assert!(idx < self.maps.len(), "active map index out of range");
         self.active_map_idx = idx;
     }
+
+    /// Reset the active map to an empty state.
+    ///
+    /// This clears all keyframes and map points from the active map,
+    /// but keeps the map entry in the Atlas.
+    pub fn reset_active_map(&mut self) {
+        self.maps[self.active_map_idx] = Map::new();
+    }
 }
 
 impl Default for Atlas {

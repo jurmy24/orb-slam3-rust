@@ -20,17 +20,29 @@ use opencv::prelude::*;
 
 use crate::atlas::keyframe_db::BowVector;
 use crate::atlas::map::{KeyFrameId, MapPointId};
-use crate::geometry::{SE3, solve_pnp_ransac_detailed};
+use crate::geometry::{solve_pnp_ransac_detailed, SE3};
 use crate::imu::{ImuBias, ImuNoise, Preintegrator};
 use crate::io::euroc::ImuEntry;
 use crate::system::messages::NewKeyFrameMsg;
 use crate::system::shared_state::SharedState;
-use crate::tracking::TrackingState;
 use crate::tracking::frame::{CameraModel, StereoFrame};
 use crate::tracking::keyframe_decision::KeyFrameDecision;
-use crate::tracking::matching::{NN_RATIO, TH_HIGH, descriptor_distance};
+use crate::tracking::matching::{descriptor_distance, NN_RATIO, TH_HIGH};
 use crate::tracking::result::{MatchInfo, TimingStats, TrackingMetrics, TrackingResult};
 use crate::tracking::tracking_frame::Frame;
+use crate::tracking::TrackingState;
+
+/// Time threshold for transitioning from RECENTLY_LOST to LOST (seconds).
+const TIME_RECENTLY_LOST_THRESHOLD: f64 = 5.0;
+
+/// Minimum number of keyframes to keep a map (below this, reset instead of create new).
+const MIN_KEYFRAMES_FOR_NEW_MAP: usize = 10;
+
+/// Minimum inliers for tracking to be considered OK.
+const MIN_INLIERS_OK: usize = 20;
+
+/// Minimum inliers to consider tracking "weak but usable" (for RECENTLY_LOST KF creation).
+const MIN_INLIERS_WEAK: usize = 10;
 
 /// Main tracking structure.
 pub struct Tracker {
@@ -69,6 +81,30 @@ pub struct Tracker {
 
     /// Number of map points in the reference keyframe (for KF decision).
     reference_kf_num_points: usize,
+
+    /// Timestamp when tracking was lost (for RECENTLY_LOST timeout).
+    time_stamp_lost: Option<f64>,
+
+    /// Last keyframe timestamp (for time-based keyframe decision).
+    last_kf_timestamp: f64,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Motion Model Tracking State
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Previous frame pose for motion model tracking.
+    last_frame_pose: Option<SE3>,
+
+    /// Motion model velocity: relative transform T_curr_prev = T_curr * T_prev^-1
+    motion_model_velocity: Option<SE3>,
+
+    /// Previous frame's matched map points (feature index -> MapPointId).
+    last_frame_map_points: Vec<Option<MapPointId>>,
+
+    /// Previous frame's 3D points in camera frame (for projection).
+    last_frame_points_cam: Vec<Option<Vector3<f64>>>,
+
+    /// Previous frame's descriptors for matching.
+    last_frame_descriptors: Mat,
 }
 
 impl Tracker {
@@ -92,6 +128,14 @@ impl Tracker {
             kf_decision: KeyFrameDecision::new(),
             kf_preintegrator: Preintegrator::new(ImuBias::zero(), ImuNoise::default()),
             reference_kf_num_points: 0,
+            time_stamp_lost: None,
+            last_kf_timestamp: 0.0,
+            // Motion model state
+            last_frame_pose: None,
+            motion_model_velocity: None,
+            last_frame_map_points: Vec::new(),
+            last_frame_points_cam: Vec::new(),
+            last_frame_descriptors: Mat::default(),
         })
     }
 
@@ -104,6 +148,7 @@ impl Tracker {
     ) -> Result<TrackingResult> {
         let t_start = Instant::now();
         let prev_pose = self.pose.clone();
+        let current_timestamp = stereo_frame.timestamp_ns as f64 / 1e9; // Convert to seconds
 
         self.frame_count += 1;
 
@@ -133,6 +178,7 @@ impl Tracker {
         // --- Map initialization or tracking ---
         let n_inliers: usize;
         let matched_map_points: Vec<Option<MapPointId>>;
+        let mut tracking_ok = false;
 
         // Check if the active map needs initialization
         let needs_init = {
@@ -144,40 +190,94 @@ impl Tracker {
             // Initialize map from first frame - this creates the first keyframe directly
             self.initialize_map(&frame, &stereo_frame, &imu_prior)?;
             n_inliers = frame.points_cam.iter().filter(|p| p.is_some()).count();
-            matched_map_points = vec![None; frame.num_features()]; // Not used in init path
+            matched_map_points = vec![None; frame.num_features()];
+            tracking_ok = n_inliers >= MIN_INLIERS_OK;
+            self.last_kf_timestamp = current_timestamp;
         } else {
-            // Stage 1: Initial pose estimation via reference keyframe tracking
-            let initial_pose = {
-                let atlas = self.shared.atlas.read();
-                if let Some(pose_ref) = self.track_with_reference_kf(&frame, &atlas) {
-                    pose_ref
-                } else {
-                    imu_prior.clone()
+            // Handle different tracking states
+            match self.state {
+                TrackingState::Ok | TrackingState::NotInitialized => {
+                    // Normal tracking: reference KF + local map
+                    let (inliers, matches) = self.track_normal(&frame, &imu_prior)?;
+                    n_inliers = inliers;
+                    matched_map_points = matches;
+                    tracking_ok = n_inliers >= MIN_INLIERS_OK;
+
+                    // Try to create keyframe even with weak tracking (helps map growth)
+                    if n_inliers >= MIN_INLIERS_WEAK {
+                        self.maybe_create_keyframe(
+                            &frame,
+                            &stereo_frame,
+                            n_inliers,
+                            &matched_map_points,
+                            current_timestamp,
+                        );
+                    }
                 }
-            };
-            self.pose = initial_pose.clone();
 
-            // Stage 2: Refine pose by tracking the local map
-            let (estimated_pose, inliers, matches) = {
-                let atlas = self.shared.atlas.read();
-                self.track_local_map(&atlas, &frame, &initial_pose)?
-            };
-            self.pose = estimated_pose;
-            n_inliers = inliers;
-            matched_map_points = matches;
+                TrackingState::RecentlyLost => {
+                    // IMU-only prediction while recently lost
+                    // Try to recover with visual tracking
+                    let (inliers, matches) = self.track_normal(&frame, &imu_prior)?;
+                    n_inliers = inliers;
+                    matched_map_points = matches;
+                    tracking_ok = n_inliers >= MIN_INLIERS_OK;
 
-            // Decide whether to create a new keyframe
-            self.maybe_create_keyframe(&frame, &stereo_frame, n_inliers, &matched_map_points);
+                    // For stereo-inertial: create keyframes even when RECENTLY_LOST
+                    // This helps gather IMU data and allows the map to grow
+                    // even during brief tracking failures (ORB-SLAM3's mInsertKFsLost)
+                    if n_inliers >= MIN_INLIERS_WEAK {
+                        self.maybe_create_keyframe(
+                            &frame,
+                            &stereo_frame,
+                            n_inliers,
+                            &matched_map_points,
+                            current_timestamp,
+                        );
+                    }
+
+                    if !tracking_ok {
+                        // Use IMU prediction only
+                        self.pose = imu_prior.clone();
+
+                        // Check timeout for RECENTLY_LOST -> LOST transition
+                        if let Some(lost_time) = self.time_stamp_lost {
+                            if current_timestamp - lost_time > TIME_RECENTLY_LOST_THRESHOLD {
+                                // Transition to LOST
+                                self.state = TrackingState::Lost;
+                            }
+                        }
+                    }
+                }
+
+                TrackingState::Lost => {
+                    // When LOST: create new map or reset current map
+                    self.handle_lost_state()?;
+
+                    // After creating new map, return early - next frame will initialize
+                    n_inliers = 0;
+                    matched_map_points = vec![None; frame.num_features()];
+                    tracking_ok = false;
+                }
+            }
         }
 
-        // Update tracking state from inlier count.
-        self.update_state(n_inliers);
+        // Update tracking state based on results
+        self.update_state_with_result(tracking_ok, current_timestamp);
 
-        // Update state and pose history.
+        // Update motion model if tracking was successful
+        if tracking_ok {
+            self.update_motion_model(&frame, &matched_map_points);
+        } else if self.state == TrackingState::Lost {
+            // Clear motion model on tracking loss
+            self.clear_motion_model();
+        }
+
+        // Update velocity from IMU prediction
         self.velocity = pred_vel;
         self.trajectory.push(self.pose.clone());
 
-        // Build metrics.
+        // Build metrics
         let n_features = frame.features.keypoints.len();
         let n_map_point_matches = n_inliers;
         let inlier_ratio = if n_map_point_matches > 0 {
@@ -223,6 +323,124 @@ impl Tracker {
         })
     }
 
+    /// Normal tracking: motion model or reference KF, followed by local map tracking.
+    ///
+    /// ORB-SLAM3 order:
+    /// 1. Try TrackWithMotionModel (constant velocity assumption)
+    /// 2. If that fails, try TrackReferenceKeyFrame
+    /// 3. Refine with TrackLocalMap
+    fn track_normal(
+        &mut self,
+        frame: &Frame,
+        imu_prior: &SE3,
+    ) -> Result<(usize, Vec<Option<MapPointId>>)> {
+        // Stage 1: Initial pose estimation
+        // Try motion model first (if we have velocity), then fall back to reference KF
+        let initial_pose = {
+            let atlas = self.shared.atlas.read();
+
+            // Try motion model first (requires previous frame data)
+            let motion_model_result = if self.motion_model_velocity.is_some() {
+                self.track_with_motion_model(frame, &atlas)
+            } else {
+                None
+            };
+
+            if let Some(pose_mm) = motion_model_result {
+                pose_mm
+            } else {
+                // Fall back to reference keyframe tracking
+                if let Some(pose_ref) = self.track_with_reference_kf(frame, &atlas) {
+                    pose_ref
+                } else {
+                    // Last resort: use IMU prior
+                    imu_prior.clone()
+                }
+            }
+        };
+        self.pose = initial_pose.clone();
+
+        // Stage 2: Refine pose by tracking the local map
+        let (estimated_pose, inliers, matches) = {
+            let atlas = self.shared.atlas.read();
+            self.track_local_map(&atlas, frame, &initial_pose)?
+        };
+        self.pose = estimated_pose;
+
+        Ok((inliers, matches))
+    }
+
+    /// Handle LOST state: create new map or reset current map.
+    fn handle_lost_state(&mut self) -> Result<()> {
+        let num_keyframes = {
+            let atlas = self.shared.atlas.read();
+            atlas.active_map().num_keyframes()
+        };
+
+        if num_keyframes < MIN_KEYFRAMES_FOR_NEW_MAP {
+            // Too few keyframes - reset current map
+            eprintln!(
+                "Tracking LOST with {} keyframes - resetting active map",
+                num_keyframes
+            );
+            let mut atlas = self.shared.atlas.write();
+            atlas.reset_active_map();
+        } else {
+            // Enough keyframes - create new map (old map preserved for potential merging)
+            eprintln!("Tracking LOST - creating new map in Atlas");
+            let mut atlas = self.shared.atlas.write();
+            atlas.create_new_map();
+        }
+
+        // Reset tracker state for new map
+        self.reference_kf = None;
+        self.reference_kf_num_points = 0;
+        self.state = TrackingState::NotInitialized;
+        self.lost_frames = 0;
+        self.time_stamp_lost = None;
+        self.kf_decision.reset();
+        self.kf_preintegrator.reset();
+        self.clear_motion_model();
+
+        Ok(())
+    }
+
+    /// Update tracking state based on tracking result.
+    fn update_state_with_result(&mut self, tracking_ok: bool, current_timestamp: f64) {
+        match self.state {
+            TrackingState::NotInitialized => {
+                if tracking_ok {
+                    self.state = TrackingState::Ok;
+                    self.lost_frames = 0;
+                    self.time_stamp_lost = None;
+                }
+            }
+            TrackingState::Ok => {
+                if tracking_ok {
+                    self.lost_frames = 0;
+                    self.time_stamp_lost = None;
+                } else {
+                    // Transition to RECENTLY_LOST
+                    self.state = TrackingState::RecentlyLost;
+                    self.time_stamp_lost = Some(current_timestamp);
+                    self.lost_frames = 1;
+                }
+            }
+            TrackingState::RecentlyLost => {
+                if tracking_ok {
+                    // Recovered!
+                    self.state = TrackingState::Ok;
+                    self.lost_frames = 0;
+                    self.time_stamp_lost = None;
+                }
+                // If not OK, state transition to LOST is handled in track_normal via timeout
+            }
+            TrackingState::Lost => {
+                // State change happens in handle_lost_state
+            }
+        }
+    }
+
     /// Decide whether to create a new keyframe, and if so, send it to Local Mapping.
     fn maybe_create_keyframe(
         &mut self,
@@ -230,22 +448,35 @@ impl Tracker {
         stereo_frame: &StereoFrame,
         n_inliers: usize,
         matched_map_points: &[Option<MapPointId>],
+        current_timestamp: f64,
     ) {
         // Don't create keyframes if flow control says to stop
         if self.shared.should_stop_keyframe_creation() {
             return;
         }
 
-        // Don't create keyframes if tracking is not OK
-        if self.state != TrackingState::Ok && self.state != TrackingState::NotInitialized {
+        // Don't create keyframes if tracking is completely lost
+        // For stereo-inertial, allow KF creation during RECENTLY_LOST (mInsertKFsLost in ORB-SLAM3)
+        if self.state == TrackingState::Lost {
             return;
         }
 
+        // Check if IMU is initialized (for time-based KF decision)
+        let imu_initialized = {
+            let atlas = self.shared.atlas.read();
+            atlas.active_map().is_imu_initialized()
+        };
+
+        // Time since last keyframe
+        let time_since_last_kf = current_timestamp - self.last_kf_timestamp;
+
         // Use KeyFrameDecision to check if we should create a keyframe
-        let should_create = self.kf_decision.should_create_keyframe(
+        let should_create = self.kf_decision.should_create_keyframe_stereo_inertial(
             stereo_frame,
             n_inliers,
             self.reference_kf_num_points,
+            time_since_last_kf,
+            imu_initialized,
         );
 
         if !should_create {
@@ -272,6 +503,9 @@ impl Tracker {
         if self.kf_sender.send(msg).is_ok() {
             // Reset preintegration accumulator
             self.kf_preintegrator.reset();
+
+            // Update last keyframe timestamp
+            self.last_kf_timestamp = current_timestamp;
 
             // Update reference keyframe info (we don't have the ID yet, but we know
             // the number of points for the next decision)
@@ -301,56 +535,6 @@ impl Tracker {
         if let Some(kf_id) = max_id {
             self.reference_kf = Some(kf_id);
         }
-    }
-
-    /// Update the high-level tracking state based on the number of inliers.
-    fn update_state(&mut self, n_inliers: usize) {
-        const MIN_INLIERS_OK: usize = 30;
-        const MIN_INLIERS_RECENTLY_LOST: usize = 15;
-        const MAX_LOST_FRAMES: usize = 5;
-
-        let tracking_good = n_inliers >= MIN_INLIERS_OK;
-        let tracking_weak = n_inliers >= MIN_INLIERS_RECENTLY_LOST;
-
-        self.state = match self.state {
-            TrackingState::NotInitialized => {
-                if tracking_good {
-                    TrackingState::Ok
-                } else {
-                    TrackingState::NotInitialized
-                }
-            }
-            TrackingState::Ok => {
-                if tracking_good || tracking_weak {
-                    self.lost_frames = 0;
-                    TrackingState::Ok
-                } else {
-                    self.lost_frames = 1;
-                    TrackingState::RecentlyLost
-                }
-            }
-            TrackingState::RecentlyLost => {
-                if tracking_good || tracking_weak {
-                    self.lost_frames = 0;
-                    TrackingState::Ok
-                } else {
-                    self.lost_frames += 1;
-                    if self.lost_frames > MAX_LOST_FRAMES {
-                        TrackingState::Lost
-                    } else {
-                        TrackingState::RecentlyLost
-                    }
-                }
-            }
-            TrackingState::Lost => {
-                if tracking_good {
-                    self.lost_frames = 0;
-                    TrackingState::Ok
-                } else {
-                    TrackingState::Lost
-                }
-            }
-        };
     }
 
     /// Initialize the map from the first frame.
@@ -454,8 +638,8 @@ impl Tracker {
         let mut pts2d = Vec::new();
         let mut mp_indices: Vec<(MapPointId, usize)> = Vec::new(); // (mp_id, feature_idx)
 
-        for mp_id in local_mp_ids {
-            let mp = match map.get_map_point(mp_id) {
+        for mp_id in &local_mp_ids {
+            let mp = match map.get_map_point(*mp_id) {
                 Some(mp) => mp,
                 None => continue,
             };
@@ -520,11 +704,21 @@ impl Tracker {
                 let kp = frame.keypoints().get(kp_idx)?;
                 pts3d.push(mp.position);
                 pts2d.push(Point2f::new(kp.pt().x, kp.pt().y));
-                mp_indices.push((mp_id, kp_idx));
+                mp_indices.push((*mp_id, kp_idx));
             }
         }
 
         let n_corr = pts3d.len();
+
+        if self.frame_count <= 5 || self.frame_count % 100 == 0 {
+            eprintln!(
+                "[track_local_map] frame={} local_kfs={} local_mps={} correspondences={}",
+                self.frame_count,
+                local_kfs.len(),
+                local_mp_ids.len(),
+                n_corr
+            );
+        }
 
         if n_corr < 4 {
             return Ok((imu_prior.clone(), n_corr, matched_map_points));
@@ -546,6 +740,11 @@ impl Tracker {
         }
 
         let n_inliers = pnp.inlier_mask.iter().filter(|&&b| b).count();
+
+        if self.frame_count <= 5 || self.frame_count % 100 == 0 {
+            eprintln!("[track_local_map] pnp_inliers={}", n_inliers);
+        }
+
         Ok((pnp.pose, n_inliers, matched_map_points))
     }
 
@@ -573,10 +772,25 @@ impl Tracker {
         let mut pts3d = Vec::new();
         let mut pts2d = Vec::new();
 
+        let total_matches = matches.len();
+        let mut matches_with_mp = 0;
+
         for m in matches.iter() {
             let feat_idx = m.query_idx as usize;
-            let mp_id = kf.get_map_point(feat_idx)?;
-            let mp = map.get_map_point(mp_id)?;
+
+            // Skip matches where the keyframe feature doesn't have an associated map point
+            let mp_id = match kf.get_map_point(feat_idx) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            // Skip invalid map points
+            let mp = match map.get_map_point(mp_id) {
+                Some(mp) => mp,
+                None => continue,
+            };
+
+            matches_with_mp += 1;
 
             if let Ok(kp) = frame.keypoints().get(m.train_idx as usize) {
                 pts3d.push(mp.position);
@@ -584,13 +798,191 @@ impl Tracker {
             }
         }
 
+        if self.frame_count <= 5 || self.frame_count % 100 == 0 {
+            eprintln!(
+                "[track_ref_kf] frame={} total_matches={} matches_with_mp={} pts3d={}",
+                self.frame_count,
+                total_matches,
+                matches_with_mp,
+                pts3d.len()
+            );
+        }
+
         if pts3d.len() < 4 {
             return None;
         }
 
-        solve_pnp_ransac_detailed(&pts3d, &pts2d, &self.camera, Some(&self.pose))
-            .ok()
-            .map(|res| res.pose)
+        let result = solve_pnp_ransac_detailed(&pts3d, &pts2d, &self.camera, Some(&self.pose));
+        if let Ok(ref res) = result {
+            let n_inliers = res.inlier_mask.iter().filter(|&&b| b).count();
+            if self.frame_count <= 5 || self.frame_count % 100 == 0 {
+                eprintln!("[track_ref_kf] pnp_inliers={}", n_inliers);
+            }
+        }
+
+        result.ok().map(|res| res.pose)
+    }
+
+    /// Motion model tracking: predict pose using constant velocity and match previous frame's map points.
+    ///
+    /// This is more robust than reference keyframe tracking when the camera is moving
+    /// because the previous frame is temporally adjacent.
+    fn track_with_motion_model(
+        &self,
+        frame: &Frame,
+        atlas: &crate::atlas::atlas::Atlas,
+    ) -> Option<SE3> {
+        // Need motion model velocity and previous frame data
+        let velocity = self.motion_model_velocity.as_ref()?;
+        let last_pose = self.last_frame_pose.as_ref()?;
+
+        // Predict current pose: T_curr = velocity * T_prev
+        // velocity is T_curr_prev, so T_curr_w = T_curr_prev * T_prev_w
+        let predicted_pose = velocity.compose(last_pose);
+
+        // Get the active map
+        let map = atlas.active_map();
+
+        // Project previous frame's map points into current frame
+        let mut pts3d = Vec::new();
+        let mut pts2d = Vec::new();
+
+        // Search radius for stereo (in pixels)
+        let search_radius: f64 = 15.0;
+
+        for (feat_idx, mp_id_opt) in self.last_frame_map_points.iter().enumerate() {
+            let mp_id = match mp_id_opt {
+                Some(id) => *id,
+                None => continue,
+            };
+
+            let mp = match map.get_map_point(mp_id) {
+                Some(mp) => mp,
+                None => continue,
+            };
+
+            // Project map point to current frame using predicted pose
+            let pose_cw = predicted_pose.inverse();
+            let p_cam = pose_cw.transform_point(&mp.position);
+
+            // Check if point is in front of camera
+            if p_cam.z <= 0.0 {
+                continue;
+            }
+
+            // Project to image plane
+            let u = self.camera.fx * p_cam.x / p_cam.z + self.camera.cx;
+            let v = self.camera.fy * p_cam.y / p_cam.z + self.camera.cy;
+
+            // Simple bounds check using principal point as approximate center
+            // (image is roughly 2*cx by 2*cy)
+            let approx_width = 2.0 * self.camera.cx;
+            let approx_height = 2.0 * self.camera.cy;
+            if u < 0.0 || u >= approx_width || v < 0.0 || v >= approx_height {
+                continue;
+            }
+
+            // Find candidate features within search radius
+            let mut best_dist = u32::MAX;
+            let mut best_idx: Option<usize> = None;
+
+            for (kp_idx, kp) in frame.keypoints().iter().enumerate() {
+                let du = kp.pt().x as f64 - u;
+                let dv = kp.pt().y as f64 - v;
+                let dist_sq = du * du + dv * dv;
+
+                if dist_sq > search_radius * search_radius {
+                    continue;
+                }
+
+                // Compare descriptors
+                let frame_desc_row = match frame.features.descriptors.row(kp_idx as i32) {
+                    Ok(row) => row,
+                    Err(_) => continue,
+                };
+                let frame_desc = match frame_desc_row.try_clone() {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+
+                let desc_dist = match descriptor_distance(&mp.descriptor, &frame_desc) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+
+                if desc_dist < best_dist && desc_dist < TH_HIGH {
+                    best_dist = desc_dist;
+                    best_idx = Some(kp_idx);
+                }
+            }
+
+            if let Some(kp_idx) = best_idx {
+                if let Ok(kp) = frame.keypoints().get(kp_idx) {
+                    pts3d.push(mp.position);
+                    pts2d.push(Point2f::new(kp.pt().x, kp.pt().y));
+                }
+            }
+        }
+
+        if self.frame_count <= 5 || self.frame_count % 100 == 0 {
+            eprintln!(
+                "[track_motion] frame={} prev_mps={} correspondences={}",
+                self.frame_count,
+                self.last_frame_map_points
+                    .iter()
+                    .filter(|x| x.is_some())
+                    .count(),
+                pts3d.len()
+            );
+        }
+
+        // Need at least 10 correspondences for motion model (ORB-SLAM3 uses 20)
+        if pts3d.len() < 10 {
+            return None;
+        }
+
+        // Solve PnP with predicted pose as initial guess
+        let result = solve_pnp_ransac_detailed(&pts3d, &pts2d, &self.camera, Some(&predicted_pose));
+
+        if let Ok(ref res) = result {
+            let n_inliers = res.inlier_mask.iter().filter(|&&b| b).count();
+            if self.frame_count <= 5 || self.frame_count % 100 == 0 {
+                eprintln!("[track_motion] pnp_inliers={}", n_inliers);
+            }
+            // Only accept if we have enough inliers
+            if n_inliers < 10 {
+                return None;
+            }
+        }
+
+        result.ok().map(|res| res.pose)
+    }
+
+    /// Update motion model state at the end of a successful tracking frame.
+    ///
+    /// Call this after pose has been estimated and before moving to next frame.
+    fn update_motion_model(&mut self, frame: &Frame, matched_map_points: &[Option<MapPointId>]) {
+        // Compute velocity: T_curr_prev = T_curr * T_prev^-1
+        if let Some(ref last_pose) = self.last_frame_pose {
+            // velocity = current_pose * last_pose.inverse()
+            let velocity = self.pose.compose(&last_pose.inverse());
+            self.motion_model_velocity = Some(velocity);
+        }
+
+        // Store current frame data for next iteration
+        self.last_frame_pose = Some(self.pose.clone());
+        self.last_frame_map_points = matched_map_points.to_vec();
+        self.last_frame_points_cam = frame.points_cam.clone();
+        self.last_frame_descriptors = frame.features.descriptors.try_clone().unwrap_or_default();
+    }
+
+    /// Clear motion model state (e.g., after tracking loss).
+    fn clear_motion_model(&mut self) {
+        self.last_frame_pose = None;
+        self.motion_model_velocity = None;
+        self.last_frame_map_points.clear();
+        self.last_frame_points_cam.clear();
+        self.last_frame_descriptors = Mat::default();
     }
 }
 

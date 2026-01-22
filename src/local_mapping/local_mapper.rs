@@ -6,6 +6,7 @@
 //! 3. Triangulates new map points from unmatched stereo features
 //! 4. Updates covisibility graph (automatic via associate)
 //! 5. Runs Local BA (stub for now)
+//! 6. IMU initialization (for visual-inertial mode)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,8 @@ use crate::atlas::map::KeyFrameId;
 use crate::system::messages::NewKeyFrameMsg;
 use crate::system::shared_state::SharedState;
 use crate::tracking::frame::CameraModel;
+
+use super::imu_init::{apply_imu_init, initialize_imu};
 
 /// Flow control threshold: if queue has more than this many keyframes,
 /// signal Tracking to stop creating new ones.
@@ -43,6 +46,7 @@ impl LocalMapper {
     ///
     /// This runs until shutdown is requested or the channel is closed.
     pub fn run(&mut self, kf_receiver: Receiver<NewKeyFrameMsg>, shared: Arc<SharedState>) {
+        let shared = Arc::clone(&shared);
         loop {
             // Check for shutdown
             if shared.is_shutdown_requested() {
@@ -71,7 +75,7 @@ impl LocalMapper {
     }
 
     /// Process a single keyframe message.
-    fn process_keyframe(&mut self, msg: NewKeyFrameMsg, shared: &SharedState) {
+    fn process_keyframe(&mut self, msg: NewKeyFrameMsg, shared: &Arc<SharedState>) {
         // Clear abort flag (we're starting fresh)
         shared.clear_abort_ba();
 
@@ -89,10 +93,29 @@ impl LocalMapper {
 
         // Step 5: Cull map points (stub - does nothing for now)
         self.cull_map_points(shared);
+
+        // Step 6: Try to initialize IMU if not yet done
+        self.try_imu_initialization(shared);
+    }
+
+    /// Attempt IMU initialization if conditions are met.
+    fn try_imu_initialization(&self, shared: &Arc<SharedState>) {
+        // Check if already initialized
+        {
+            let atlas = shared.atlas.read();
+            if atlas.active_map().is_imu_initialized() {
+                return;
+            }
+        }
+
+        // Try to initialize
+        if let Some(result) = initialize_imu(shared) {
+            apply_imu_init(shared, &result);
+        }
     }
 
     /// Insert the keyframe into the map.
-    fn insert_keyframe(&self, msg: &NewKeyFrameMsg, shared: &SharedState) -> KeyFrameId {
+    fn insert_keyframe(&self, msg: &NewKeyFrameMsg, shared: &Arc<SharedState>) -> KeyFrameId {
         let mut atlas = shared.atlas.write();
         let map = atlas.active_map_mut();
 
@@ -125,7 +148,7 @@ impl LocalMapper {
         &self,
         msg: &NewKeyFrameMsg,
         kf_id: KeyFrameId,
-        shared: &SharedState,
+        shared: &Arc<SharedState>,
     ) {
         let mut atlas = shared.atlas.write();
         let map = atlas.active_map_mut();
@@ -145,7 +168,12 @@ impl LocalMapper {
     /// 2. Was NOT matched to an existing map point during tracking
     ///
     /// We create a new MapPoint at the triangulated world position.
-    fn triangulate_new_points(&self, msg: &NewKeyFrameMsg, kf_id: KeyFrameId, shared: &SharedState) {
+    fn triangulate_new_points(
+        &self,
+        msg: &NewKeyFrameMsg,
+        kf_id: KeyFrameId,
+        shared: &Arc<SharedState>,
+    ) {
         let mut atlas = shared.atlas.write();
         let map = atlas.active_map_mut();
 
@@ -186,7 +214,7 @@ impl LocalMapper {
     ///
     /// The optimization should check `shared.should_abort_ba()` periodically
     /// and exit early if a new keyframe arrived.
-    fn local_bundle_adjustment(&self, _kf_id: KeyFrameId, _shared: &SharedState) {
+    fn local_bundle_adjustment(&self, _kf_id: KeyFrameId, _shared: &Arc<SharedState>) {
         // TODO: Implement local BA
         // For now, this is a no-op. The map will drift but tracking will work.
     }
@@ -197,7 +225,7 @@ impl LocalMapper {
     /// - Have too few observations
     /// - Have high reprojection error
     /// - Are occluded in most recent frames
-    fn cull_map_points(&self, _shared: &SharedState) {
+    fn cull_map_points(&self, _shared: &Arc<SharedState>) {
         // TODO: Implement map point culling
     }
 }
