@@ -8,6 +8,32 @@ use opencv::prelude::*;
 
 use crate::tracking::frame::features::FeatureSet;
 
+/// ORB-SLAM3 matching thresholds
+pub const TH_HIGH: u32 = 100;  // Max descriptor distance for acceptance
+pub const TH_LOW: u32 = 50;    // Stricter threshold
+pub const NN_RATIO: f32 = 0.75; // Ratio test threshold (best/second_best)
+
+/// Compute Hamming distance between two ORB descriptors (32-byte binary).
+/// Returns the number of differing bits.
+///
+/// # Arguments
+/// * `desc1` - First ORB descriptor (1 row x 32 cols)
+/// * `desc2` - Second ORB descriptor (1 row x 32 cols)
+///
+/// # Returns
+/// Hamming distance as u32 (number of differing bits)
+pub fn descriptor_distance(desc1: &Mat, desc2: &Mat) -> Result<u32> {
+    let mut hamming_dist = 0u32;
+    // ORB descriptors are 1 row x 32 cols (256 bits)
+    let cols = desc1.cols().min(desc2.cols());
+    for j in 0..cols {
+        let val1 = *desc1.at_2d::<u8>(0, j)?;
+        let val2 = *desc2.at_2d::<u8>(0, j)?;
+        hamming_dist += (val1 ^ val2).count_ones();
+    }
+    Ok(hamming_dist)
+}
+
 pub struct TemporalMatcher {
     matcher: BFMatcher,
 }

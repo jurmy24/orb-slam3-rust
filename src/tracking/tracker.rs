@@ -24,6 +24,7 @@ use crate::imu::{ImuBias, ImuNoise, Preintegrator};
 use crate::io::euroc::ImuEntry;
 use crate::tracking::TrackingState;
 use crate::tracking::frame::{CameraModel, StereoFrame};
+use crate::tracking::matching::{NN_RATIO, TH_HIGH, descriptor_distance};
 use crate::tracking::result::{MatchInfo, TimingStats, TrackingMetrics, TrackingResult};
 use crate::tracking::tracking_frame::Frame;
 
@@ -283,15 +284,22 @@ impl Tracker {
         imu_prior: &SE3,
     ) -> Result<(SE3, usize)> {
         // --- Build local keyframe set K1 ∪ K2 using covisibility graph ---
+        // K1 is the reference keyframe (typically the last keyframe)
         let mut k1: HashSet<KeyFrameId> = HashSet::new();
         if let Some(ref_kf) = self.reference_kf {
+            // Add reference keyframe to K1
             k1.insert(ref_kf);
         } else {
+            // If no reference keyframe, use all keyframes from map
+            // On first frame this is the only keyframe
             for id in map.keyframe_ids() {
                 k1.insert(*id);
             }
         }
 
+        // Set of keyframes that are covisible with K1 (the local keyframes)
+        // Two frames are covisible if they share many of the same points
+        // We're looking for keyframes that look similar to the reference keyframe
         let mut k2: HashSet<KeyFrameId> = HashSet::new();
         for &kf_id in &k1 {
             for nid in map.get_local_keyframes(kf_id, 10) {
@@ -299,6 +307,7 @@ impl Tracker {
             }
         }
 
+        // Union of K1 and K2
         let local_kfs: Vec<KeyFrameId> = k1.union(&k2).copied().collect();
         if local_kfs.is_empty() {
             // No keyframes yet – fall back to prior.
@@ -306,12 +315,15 @@ impl Tracker {
         }
 
         // Collect local MapPoints observed by K1 ∪ K2.
+        // This is all 3D map points that were triangulated from observations in any of the local keyframes
         let local_mp_ids = map.get_map_points_from_keyframes(&local_kfs);
 
         // Build 3D-2D correspondences from projected local map points.
         let mut pts3d = Vec::new();
         let mut pts2d = Vec::new();
 
+        // For each local map point, project it into the current frame and find the closest keypoint
+        // Note that a map point is a 3D point that was triangulated from observations in one or more keyframes
         for mp_id in local_mp_ids {
             let mp = if let Some(mp) = map.get_map_point(mp_id) {
                 mp
@@ -319,31 +331,69 @@ impl Tracker {
                 continue;
             };
 
-            // Transform to camera frame.
+            // Transform to camera frame (world to camera)
             let pose_cw = self.pose.inverse();
             let p_cam = pose_cw.transform_point(&mp.position);
+            // If the point is behind the camera, skip it
             if p_cam.z <= 0.0 {
                 continue;
             }
 
-            // Project.
+            // Project to image plane using pinhole model
             let u = self.camera.fx * p_cam.x / p_cam.z + self.camera.cx;
             let v = self.camera.fy * p_cam.y / p_cam.z + self.camera.cy;
 
-            // Find closest keypoint.
-            let mut best_dist = 10.0_f64;
-            let mut best_kp = None;
-            for kp in frame.keypoints().iter() {
+            // ORB-SLAM3-style descriptor matching: collect candidates within radius
+            const SEARCH_RADIUS: f64 = 15.0; // pixels
+            let mut candidates: Vec<usize> = Vec::new();
+            for (kp_idx, kp) in frame.keypoints().iter().enumerate() {
                 let du = kp.pt().x as f64 - u;
                 let dv = kp.pt().y as f64 - v;
-                let dist = (du * du + dv * dv).sqrt();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_kp = Some(kp);
+                let spatial_dist_sq = du * du + dv * dv;
+                if spatial_dist_sq < SEARCH_RADIUS * SEARCH_RADIUS {
+                    candidates.push(kp_idx);
                 }
             }
 
-            if let Some(kp) = best_kp {
+            if candidates.is_empty() {
+                continue;
+            }
+
+            // Find best and second-best descriptor matches
+            let mut best_dist = u32::MAX;
+            let mut second_best_dist = u32::MAX;
+            let mut best_idx: Option<usize> = None;
+
+            for &kp_idx in &candidates {
+                let frame_desc_row = frame.features.descriptors.row(kp_idx as i32)?;
+                // Clone the row to convert BoxedRef<Mat> to Mat
+                let frame_desc = frame_desc_row.try_clone()?;
+                let dist = descriptor_distance(&mp.descriptor, &frame_desc)?;
+
+                if dist < best_dist {
+                    second_best_dist = best_dist;
+                    best_dist = dist;
+                    best_idx = Some(kp_idx);
+                } else if dist < second_best_dist {
+                    second_best_dist = dist;
+                }
+            }
+
+            // Apply threshold check
+            if best_dist > TH_HIGH {
+                continue;
+            }
+
+            // Apply ratio test (Lowe's ratio) - skip if only one candidate
+            if candidates.len() > 1 {
+                if (best_dist as f32) > NN_RATIO * (second_best_dist as f32) {
+                    continue; // Ambiguous match, reject
+                }
+            }
+
+            // Accept match
+            if let Some(kp_idx) = best_idx {
+                let kp = frame.keypoints().get(kp_idx)?;
                 pts3d.push(mp.position);
                 pts2d.push(Point2f::new(kp.pt().x, kp.pt().y));
             }
