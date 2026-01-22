@@ -4,7 +4,7 @@ use nalgebra::Vector3;
 use rust_vslam::atlas::atlas::Atlas;
 use rust_vslam::io::euroc::EurocDataset;
 use rust_vslam::tracking::Tracker;
-use rust_vslam::tracking::frame::{CameraModel, StereoProcessor};
+use rust_vslam::tracking::frame::{CameraModel, StereoProcessor, StereoFrame};
 use rust_vslam::tracking::result::TrackingResult;
 use rust_vslam::viz::rerun::RerunVisualizer;
 
@@ -45,7 +45,7 @@ fn main() -> Result<()> {
         let imu_between = dataset.imu_between(t_start, t_end);
 
         // Process stereo frame
-        let stereo_frame = stereo.process(&pair.left, &pair.right, pair.timestamp_ns)?;
+        let stereo_frame: StereoFrame = stereo.process(&pair.left, &pair.right, pair.timestamp_ns)?;
 
         // Run tracker
         let result: TrackingResult =

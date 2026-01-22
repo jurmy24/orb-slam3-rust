@@ -1,6 +1,6 @@
 use nalgebra::{Matrix3, UnitQuaternion, Vector3};
 
-use super::sample::{ImuBias, ImuNoise, ImuSample, GRAVITY};
+use super::sample::{GRAVITY, ImuBias, ImuNoise, ImuSample};
 
 /// Preintegrated motion between two frames.
 #[derive(Debug, Clone, Copy)]
@@ -64,9 +64,10 @@ impl Preintegrator {
         let accel_body = 0.5 * (accel_prev + accel_curr);
         let accel_world = self.state.delta_rot * accel_body + GRAVITY;
 
-        // Update velocity and position
+        // Update velocity and position (order matters: use v_k for position before updating to v_{k+1})
+        let vel_prev = self.state.delta_vel;
         self.state.delta_vel += accel_world * dt;
-        self.state.delta_pos += self.state.delta_vel * dt + 0.5 * accel_world * dt * dt;
+        self.state.delta_pos += vel_prev * dt + 0.5 * accel_world * dt * dt;
         self.state.dt += dt;
     }
 

@@ -19,12 +19,12 @@ use opencv::prelude::*;
 use crate::atlas::atlas::Atlas;
 use crate::atlas::keyframe_db::BowVector;
 use crate::atlas::map::{KeyFrameId, MapPointId};
-use crate::geometry::{solve_pnp_ransac_detailed, SE3};
+use crate::geometry::{SE3, solve_pnp_ransac_detailed};
 use crate::imu::{ImuBias, ImuNoise, Preintegrator};
 use crate::io::euroc::ImuEntry;
+use crate::tracking::TrackingState;
 use crate::tracking::frame::{CameraModel, StereoFrame};
 use crate::tracking::result::{MatchInfo, TimingStats, TrackingMetrics, TrackingResult};
-use crate::tracking::TrackingState;
 use crate::tracking::tracking_frame::Frame;
 
 /// Main tracking structure.
@@ -74,18 +74,18 @@ impl Tracker {
         atlas: &mut Atlas,
     ) -> Result<TrackingResult> {
         let t_start = Instant::now();
-        let prev_pose = self.pose.clone();
+        let prev_pose = self.pose.clone(); // pose before updating this tracker
 
         self.frame_count += 1;
 
         // Build tracking frame from stereo output.
         let frame = Frame::from_stereo(stereo_frame);
 
-        // Integrate IMU for motion prior.
+        // Integrate IMU for motion prior by iterating over IMU pairs
         self.preintegrator.reset();
         for pair in imu_measurements.windows(2) {
-            let prev = pair[0].sample;
-            let curr = pair[1].sample;
+            let prev = pair[0].sample; // previous IMU sample
+            let curr = pair[1].sample; // current IMU sample
             self.preintegrator.integrate(prev, curr);
         }
 
@@ -109,8 +109,7 @@ impl Tracker {
             n_inliers = frame.points_cam.iter().filter(|p| p.is_some()).count();
         } else {
             // Track using projection of existing map points.
-            let (estimated_pose, inliers) =
-                self.track_local_map(active_map, &frame, &imu_prior)?;
+            let (estimated_pose, inliers) = self.track_local_map(active_map, &frame, &imu_prior)?;
             self.pose = estimated_pose;
             n_inliers = inliers;
 
@@ -233,12 +232,7 @@ impl Tracker {
 
     /// Initialize the map from the first frame by creating a KeyFrame and
     /// MapPoints from all valid stereo points.
-    fn initialize_map(
-        &mut self,
-        atlas: &mut Atlas,
-        frame: &Frame,
-        imu_prior: &SE3,
-    ) -> Result<()> {
+    fn initialize_map(&mut self, atlas: &mut Atlas, frame: &Frame, imu_prior: &SE3) -> Result<()> {
         let map = atlas.active_map_mut();
         // Use IMU prior as first pose.
         self.pose = imu_prior.clone();
@@ -259,8 +253,7 @@ impl Tracker {
                 // For now store an empty descriptor; descriptor-based matching
                 // can be added later without changing the API.
                 let descriptor = opencv::core::Mat::default();
-                let mp_id =
-                    map.create_map_point(p_world, descriptor, kf_id);
+                let mp_id = map.create_map_point(p_world, descriptor, kf_id);
                 map.associate(kf_id, feat_idx, mp_id);
             }
         }
@@ -373,11 +366,7 @@ impl Tracker {
     /// Placeholder for reference keyframe tracking, to be filled in a later
     /// phase. This uses descriptor matching between the reference keyframe
     /// and the current frame to obtain an initial pose estimate.
-    fn track_with_reference_kf(
-        &self,
-        frame: &Frame,
-        atlas: &Atlas,
-    ) -> Option<SE3> {
+    fn track_with_reference_kf(&self, frame: &Frame, atlas: &Atlas) -> Option<SE3> {
         let ref_kf_id = self.reference_kf?;
         let map = atlas.active_map();
         let kf = map.get_keyframe(ref_kf_id)?;
@@ -439,4 +428,3 @@ fn compute_bow_stub(descriptors: &Mat) -> BowVector {
     }
     bow
 }
-

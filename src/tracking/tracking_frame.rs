@@ -52,4 +52,3 @@ impl Frame {
         &self.features.keypoints
     }
 }
-
