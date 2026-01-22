@@ -5,7 +5,7 @@
 //! 2. Associates matched map points
 //! 3. Triangulates new map points from unmatched stereo features
 //! 4. Updates covisibility graph (automatic via associate)
-//! 5. Runs Local BA (stub for now)
+//! 5. Local BA (DISABLED - needs debugging)
 //! 6. IMU initialization (for visual-inertial mode)
 
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use opencv::prelude::*;
 
 use crate::atlas::keyframe_db::BowVector;
 use crate::atlas::map::KeyFrameId;
+use crate::optimizer::{local_bundle_adjustment as run_local_ba, LocalBAConfig};
 use crate::system::messages::NewKeyFrameMsg;
 use crate::system::shared_state::SharedState;
 use crate::tracking::frame::CameraModel;
@@ -88,8 +89,12 @@ impl LocalMapper {
         // Step 3: Triangulate new map points from unmatched stereo features
         self.triangulate_new_points(&msg, kf_id, shared);
 
-        // Step 4: Local BA (stub - does nothing for now)
-        self.local_bundle_adjustment(kf_id, shared);
+        // Step 4: Local BA
+        // TODO: BA is currently DISABLED - the Jacobian/gradient computation has bugs
+        // that cause divergence. Tracking works well without BA for now.
+        // See issue: Gauss-Newton BA diverges on first iteration (error increases)
+        // Needs: Deep comparison with g2o's exact implementation
+        // self.local_bundle_adjustment(kf_id, shared);
 
         // Step 5: Cull map points (stub - does nothing for now)
         self.cull_map_points(shared);
@@ -206,17 +211,33 @@ impl LocalMapper {
         }
     }
 
-    /// Local Bundle Adjustment (stub - does nothing for now).
+    /// Local Bundle Adjustment.
     ///
-    /// In a full implementation, this would optimize:
-    /// - Poses of recent keyframes
+    /// Optimizes:
+    /// - Poses of recent keyframes (covisible with current)
     /// - Positions of map points observed by those keyframes
     ///
-    /// The optimization should check `shared.should_abort_ba()` periodically
-    /// and exit early if a new keyframe arrived.
-    fn local_bundle_adjustment(&self, _kf_id: KeyFrameId, _shared: &Arc<SharedState>) {
-        // TODO: Implement local BA
-        // For now, this is a no-op. The map will drift but tracking will work.
+    /// The optimization checks `shared.should_abort_ba()` periodically
+    /// and exits early if a new keyframe arrived.
+    fn local_bundle_adjustment(&self, kf_id: KeyFrameId, shared: &Arc<SharedState>) {
+        let config = LocalBAConfig::default();
+        let should_stop = || shared.should_abort_ba();
+        let mut atlas = shared.atlas.write();
+        let map = atlas.active_map_mut();
+        if let Some(result) = run_local_ba(map, kf_id, &self.camera, &config, &should_stop) {
+            if result.iterations > 0 {
+                eprintln!(
+                    "[LocalBA] kf={} iters={} error: {:.2} -> {:.2} (kfs={}, mps={}, obs={})",
+                    kf_id.0,
+                    result.iterations,
+                    result.initial_error,
+                    result.final_error,
+                    result.num_keyframes,
+                    result.num_map_points,
+                    result.num_observations
+                );
+            }
+        }
     }
 
     /// Cull bad map points (stub - does nothing for now).
