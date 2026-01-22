@@ -8624,9 +8624,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "approx",
+ "crossbeam-channel",
  "csv",
  "nalgebra",
  "opencv",
+ "parking_lot",
  "rayon",
  "rerun",
  "serde",

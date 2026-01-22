@@ -267,6 +267,11 @@ impl KeyFrame {
         self.covisibility_weights.keys()
     }
 
+    /// Get read-only access to the covisibility weights map.
+    pub fn covisibility_weights(&self) -> &HashMap<KeyFrameId, usize> {
+        &self.covisibility_weights
+    }
+
     /// Get the N best covisible KeyFrames (most shared points first).
     ///
     /// This rebuilds the sorted cache if needed.

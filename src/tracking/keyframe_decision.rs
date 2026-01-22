@@ -23,7 +23,7 @@ impl KeyFrameDecision {
     pub fn new() -> Self {
         Self {
             min_frames: 0,
-            max_frames: 30,
+            max_frames: 15,
             min_tracked_ratio: 0.9,
             frames_since_kf: 0,
         }

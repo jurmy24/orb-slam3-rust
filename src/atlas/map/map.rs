@@ -350,9 +350,30 @@ impl Map {
     /// Get local KeyFrames around a given KeyFrame using covisibility.
     ///
     /// Returns the N KeyFrames with the most shared MapPoints.
+    /// Note: This version updates the cached sorted list if dirty.
     pub fn get_local_keyframes(&mut self, kf_id: KeyFrameId, n: usize) -> Vec<KeyFrameId> {
         if let Some(kf) = self.keyframes.get_mut(&kf_id) {
             kf.get_best_covisibles(n)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get local KeyFrames around a given KeyFrame using covisibility (immutable version).
+    ///
+    /// Returns the N KeyFrames with the most shared MapPoints.
+    /// This version doesn't use caching - it sorts on each call.
+    /// Suitable for read-only access patterns.
+    pub fn get_local_keyframes_readonly(&self, kf_id: KeyFrameId, n: usize) -> Vec<KeyFrameId> {
+        if let Some(kf) = self.keyframes.get(&kf_id) {
+            // Get all covisibility weights and sort by weight descending
+            let mut covisibles: Vec<(KeyFrameId, usize)> = kf
+                .covisibility_weights()
+                .iter()
+                .map(|(&id, &weight)| (id, weight))
+                .collect();
+            covisibles.sort_by(|a, b| b.1.cmp(&a.1));
+            covisibles.into_iter().take(n).map(|(id, _)| id).collect()
         } else {
             Vec::new()
         }
