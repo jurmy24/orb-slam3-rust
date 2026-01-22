@@ -1,5 +1,7 @@
 use nalgebra::Vector3;
 
+use super::types::Matrix6;
+
 /// Gravity vector in world frame (m/s^2).
 pub const GRAVITY: Vector3<f64> = Vector3::new(0.0, 0.0, -9.81);
 
@@ -17,6 +19,26 @@ impl ImuNoise {
             sigma_gyro: 1.7e-4,
             sigma_accel: 2.0e-3,
         }
+    }
+
+    /// Constructs the 6×6 measurement noise covariance matrix Q for a time step dt.
+    ///
+    /// Q = diag(σ_g², σ_g², σ_g², σ_a², σ_a², σ_a²) * dt
+    ///
+    /// The noise is scaled by dt because discrete-time noise variance accumulates
+    /// proportionally with integration time.
+    pub fn measurement_covariance(&self, dt: f64) -> Matrix6 {
+        let sigma_gyro_sq = self.sigma_gyro * self.sigma_gyro * dt;
+        let sigma_accel_sq = self.sigma_accel * self.sigma_accel * dt;
+
+        Matrix6::from_diagonal(&nalgebra::Vector6::new(
+            sigma_gyro_sq,
+            sigma_gyro_sq,
+            sigma_gyro_sq,
+            sigma_accel_sq,
+            sigma_accel_sq,
+            sigma_accel_sq,
+        ))
     }
 }
 

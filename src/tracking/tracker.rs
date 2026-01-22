@@ -54,7 +54,7 @@ impl Tracker {
     pub fn new(camera: CameraModel) -> Result<Self> {
         Ok(Self {
             camera,
-            preintegrator: Preintegrator::new(ImuBias::zero(), ImuNoise::default()),
+            preintegrator: Preintegrator::new_with_covariance(ImuBias::zero(), ImuNoise::default()),
             pose: SE3::identity(),
             velocity: Vector3::zeros(),
             trajectory: vec![SE3::identity()],
@@ -89,6 +89,7 @@ impl Tracker {
             self.preintegrator.integrate(prev, curr);
         }
 
+        // Propagate the preintegrated state to get the motion prior
         let (pred_rot, pred_pos, pred_vel) =
             self.preintegrator
                 .propagate(self.pose.rotation, self.pose.translation, self.velocity);
@@ -98,10 +99,12 @@ impl Tracker {
         };
 
         // --- Map initialization or tracking ---
+        // Get the active map
         let active_map = atlas.active_map_mut();
 
         let mut n_inliers: usize;
 
+        // If the active map is empty, initialize it
         if active_map.num_keyframes() == 0 {
             // Initialize map from first frame.
             self.initialize_map(atlas, &frame, &imu_prior)?;
