@@ -31,6 +31,15 @@ pub struct ImuEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct GroundTruthEntry {
+    pub timestamp_ns: u64,
+    pub pose: SE3, // position + orientation
+    pub velocity: Vector3<f64>,
+    pub gyro_bias: Vector3<f64>,
+    pub accel_bias: Vector3<f64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct StereoCalibration {
     pub k_left: Matrix3<f64>,
     pub k_right: Matrix3<f64>,
@@ -46,6 +55,7 @@ pub struct EurocDataset {
     pub cam0_entries: Vec<ImageEntry>,
     pub cam1_entries: Vec<ImageEntry>,
     pub imu_entries: Vec<ImuEntry>,
+    pub groundtruth: Vec<GroundTruthEntry>,
     pub calibration: StereoCalibration,
 }
 
@@ -60,6 +70,12 @@ impl EurocDataset {
         }
 
         let imu_entries = load_imu_list(root.join("imu0/data.csv"))?;
+        // Ground truth is optional - some datasets might not have it
+        let groundtruth = load_groundtruth_list(root.join("state_groundtruth_estimate0/data.csv"))
+            .unwrap_or_else(|e| {
+                eprintln!("Warning: Could not load ground truth: {}. Continuing without it.", e);
+                Vec::new()
+            });
         let calib = load_stereo_calibration(&root)?;
 
         Ok(Self {
@@ -67,6 +83,7 @@ impl EurocDataset {
             cam0_entries,
             cam1_entries,
             imu_entries,
+            groundtruth,
             calibration: calib,
         })
     }
@@ -119,6 +136,41 @@ impl EurocDataset {
             .iter()
             .filter(|e| e.timestamp_ns >= t_ns_start && e.timestamp_ns <= t_ns_end)
             .cloned()
+            .collect()
+    }
+
+    /// Get all ground truth positions up to (and including) the given timestamp.
+    /// Transforms from body/IMU frame to camera frame (cam0) and aligns to SLAM origin.
+    /// Uses binary search for O(log n) lookup instead of O(n) scan.
+    /// 
+    /// Note: GT pose is body pose in reference/world frame. We transform the full pose
+    /// from body to camera: T_world_cam = T_world_body * T_body_cam = T_world_body * T_cam0_body^-1
+    /// Then we subtract the first GT position so trajectories are origin-aligned.
+    pub fn groundtruth_positions_until(&self, timestamp_ns: u64) -> Vec<Vector3<f64>> {
+        if self.groundtruth.is_empty() {
+            return Vec::new();
+        }
+        
+        // Transform from body frame to camera frame: T_cam0_body
+        // GT pose is T_world_body, we need T_world_cam = T_world_body * T_body_cam0
+        let t_body_cam0 = self.calibration.t_cam0_body.inverse();
+        
+        // Get the first GT position (to align with SLAM origin)
+        let first_gt_cam = self.groundtruth[0].pose.compose(&t_body_cam0).translation;
+        
+        // Use binary search to find the cutoff point efficiently
+        let cutoff_idx = self.groundtruth
+            .partition_point(|gt| gt.timestamp_ns <= timestamp_ns);
+        
+        self.groundtruth[..cutoff_idx]
+            .iter()
+            .map(|gt| {
+                // Transform full pose from body to camera, then extract camera position in world frame
+                // T_world_cam = T_world_body * T_body_cam0
+                let t_world_cam = gt.pose.compose(&t_body_cam0);
+                // Subtract first position to align with SLAM origin
+                t_world_cam.translation - first_gt_cam
+            })
             .collect()
     }
 }
@@ -177,6 +229,70 @@ fn load_imu_list(csv_path: PathBuf) -> Result<Vec<ImuEntry>> {
                 accel,
                 gyro,
             },
+        });
+    }
+    Ok(entries)
+}
+
+fn load_groundtruth_list(csv_path: PathBuf) -> Result<Vec<GroundTruthEntry>> {
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(false)
+        .comment(Some(b'#'))
+        .from_path(&csv_path)
+        .with_context(|| format!("Failed to open {}", csv_path.display()))?;
+
+    let mut entries = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec?;
+        // CSV format: timestamp, p_RS_R_x, p_RS_R_y, p_RS_R_z, q_RS_w, q_RS_x, q_RS_y, q_RS_z,
+        //             v_RS_R_x, v_RS_R_y, v_RS_R_z, b_w_RS_S_x, b_w_RS_S_y, b_w_RS_S_z,
+        //             b_a_RS_S_x, b_a_RS_S_y, b_a_RS_S_z
+        if rec.len() < 17 {
+            continue;
+        }
+        let ts: u64 = rec[0].trim().parse()?;
+
+        // Position (p_RS_R_x/y/z)
+        let position = Vector3::new(
+            rec[1].trim().parse()?,
+            rec[2].trim().parse()?,
+            rec[3].trim().parse()?,
+        );
+
+        // Orientation quaternion (q_RS_w/x/y/z) - w-first format
+        let qw: f64 = rec[4].trim().parse()?;
+        let qx: f64 = rec[5].trim().parse()?;
+        let qy: f64 = rec[6].trim().parse()?;
+        let qz: f64 = rec[7].trim().parse()?;
+        let pose = SE3::from_quaternion(qw, qx, qy, qz, position);
+
+        // Velocity (v_RS_R_x/y/z)
+        let velocity = Vector3::new(
+            rec[8].trim().parse()?,
+            rec[9].trim().parse()?,
+            rec[10].trim().parse()?,
+        );
+
+        // Gyro bias (b_w_RS_S_x/y/z)
+        let gyro_bias = Vector3::new(
+            rec[11].trim().parse()?,
+            rec[12].trim().parse()?,
+            rec[13].trim().parse()?,
+        );
+
+        // Accel bias (b_a_RS_S_x/y/z)
+        let accel_bias = Vector3::new(
+            rec[14].trim().parse()?,
+            rec[15].trim().parse()?,
+            rec[16].trim().parse()?,
+        );
+
+        entries.push(GroundTruthEntry {
+            timestamp_ns: ts,
+            pose,
+            velocity,
+            gyro_bias,
+            accel_bias,
         });
     }
     Ok(entries)
