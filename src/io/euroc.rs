@@ -140,13 +140,15 @@ impl EurocDataset {
             .collect()
     }
 
-    /// Get all ground truth positions up to (and including) the given timestamp.
+    /// Get ground truth positions up to (and including) the given timestamp.
     /// Transforms from body/IMU frame to camera frame (cam0) and aligns to SLAM origin.
     /// Uses binary search for O(log n) lookup instead of O(n) scan.
     ///
     /// Note: GT pose is body pose in reference/world frame. We transform the full pose
     /// from body to camera: T_world_cam = T_world_body * T_body_cam = T_world_body * T_cam0_body^-1
     /// Then we subtract the first GT position so trajectories are origin-aligned.
+    ///
+    /// Downsamples from 200Hz (IMU rate) to ~20Hz (camera rate) for visualization efficiency.
     pub fn groundtruth_positions_until(&self, timestamp_ns: u64) -> Vec<Vector3<f64>> {
         if self.groundtruth.is_empty() {
             return Vec::new();
@@ -164,8 +166,12 @@ impl EurocDataset {
             .groundtruth
             .partition_point(|gt| gt.timestamp_ns <= timestamp_ns);
 
+        // Downsample: GT is at 200Hz, camera at 20Hz, so take every 10th sample
+        const DOWNSAMPLE_FACTOR: usize = 10;
+
         self.groundtruth[..cutoff_idx]
             .iter()
+            .step_by(DOWNSAMPLE_FACTOR)
             .map(|gt| {
                 // Transform full pose from body to camera, then extract camera position in world frame
                 // T_world_cam = T_world_body * T_body_cam0

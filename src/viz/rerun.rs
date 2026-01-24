@@ -1,13 +1,12 @@
 //! Rerun-based visualization for stereo-inertial SLAM.
 //!
 //! Entity hierarchy:
-//!     status               - Status bar (text document)
+//!     status               - Status bar with tracking state, IMU state, and key metrics
 //!     camera/
 //!         image            - Left camera image
-//!         image/inliers    - Inlier features (circles, depth-colored or green)
-//!         image/outliers   - Outlier features (triangles, depth-colored or red)
+//!         image/inliers    - Inlier features (green dots)
+//!         image/outliers   - Outlier features (red dots)
 //!         image/unmatched  - Unmatched ORB features (gray dots)
-//!         metrics          - Image metrics text
 //!     world/
 //!         camera           - Current camera frustum (large, bright)
 //!         trajectory       - Trajectory line (gray, thin)
@@ -37,7 +36,6 @@ use crate::tracking::result::{MatchInfo, TimingStats, TrackingMetrics};
 
 pub struct RerunVisualizer {
     rec: RecordingStream,
-    depth_coloring_enabled: bool,
     last_fps: f64,
     frame_times: Vec<f64>,
     start_timestamp_ns: Option<u64>,
@@ -48,11 +46,11 @@ impl RerunVisualizer {
     const BLUEPRINT_PATH: &'static str = "src/viz/rust-orb-slam3-stereo-inertial.rbl";
 
     pub fn new(app_name: &str) -> Self {
+        // Runs rerun viewer in a separate process
         let rec = rerun::RecordingStreamBuilder::new(app_name)
             .spawn()
             .expect("Failed to spawn rerun viewer");
 
-        // Load saved blueprint layout if it exists
         let blueprint_path = std::path::Path::new(Self::BLUEPRINT_PATH);
         if blueprint_path.exists() {
             if let Err(e) = rec.log_file_from_path(blueprint_path, None, false) {
@@ -60,21 +58,16 @@ impl RerunVisualizer {
             }
         }
 
-        // Set up coordinate system (Right-Down-Forward, typical camera convention) for the world frame
-        rec.log_static("world", &rerun::ViewCoordinates::RDF()).ok();
+        // Set up coordinate system for world frame visualization
+        // EuRoC uses Z-up world frame, so we use Right-Forward-Up (X=right, Y=forward, Z=up)
+        rec.log_static("world", &rerun::ViewCoordinates::RFU()).ok();
 
         Self {
             rec,
-            depth_coloring_enabled: true,
             last_fps: 0.0,
             frame_times: Vec::new(),
             start_timestamp_ns: None,
         }
-    }
-
-    /// Toggle depth-based coloring for 2D features.
-    pub fn set_depth_coloring(&mut self, enabled: bool) {
-        self.depth_coloring_enabled = enabled;
     }
 
     /// Set the current timestamp for all subsequent logs (uses relative time from first frame)
@@ -92,6 +85,7 @@ impl RerunVisualizer {
         tracking_state: TrackingState,
         imu_state: ImuInitState,
         metrics: &TrackingMetrics,
+        n_matched: usize,
         fps: f64,
     ) {
         let state_indicator = match tracking_state {
@@ -114,8 +108,15 @@ impl RerunVisualizer {
         };
 
         let status_text = format!(
-            "{} | IMU: {} | Features: {} | Inliers: {} ({:.0}%) | FPS: {:.1}",
-            state_indicator, imu_indicator, metrics.n_features, metrics.n_inliers, inlier_pct, fps
+            "{} | IMU: {} | Features: {} | Matched: {} | Inliers: {} ({:.0}%) | Reproj: {:.2}px | FPS: {:.1}",
+            state_indicator,
+            imu_indicator,
+            metrics.n_features,
+            n_matched,
+            metrics.n_inliers,
+            inlier_pct,
+            metrics.reproj_error_mean_px,
+            fps
         );
 
         self.rec
@@ -139,7 +140,7 @@ impl RerunVisualizer {
         }
     }
 
-    /// Log annotated features (inliers, outliers, unmatched) with optional depth coloring.
+    /// Log annotated features (inliers, outliers, unmatched).
     pub fn log_annotated_features(
         &self,
         frame: &StereoFrame,
@@ -148,7 +149,6 @@ impl RerunVisualizer {
         outlier_indices: &[usize],
     ) {
         let keypoints = &frame.left_features.keypoints;
-        let points_cam = &frame.points_cam;
 
         // Collect matched feature indices
         let matched_set: HashSet<usize> = match_info
@@ -157,69 +157,21 @@ impl RerunVisualizer {
             .map(|(_, idx)| *idx)
             .collect();
 
-        // Separate inliers and outliers with depth info
         let mut inlier_points: Vec<[f32; 2]> = Vec::new();
-        let mut inlier_colors: Vec<[u8; 3]> = Vec::new();
         let mut outlier_points: Vec<[f32; 2]> = Vec::new();
-        let mut outlier_colors: Vec<[u8; 3]> = Vec::new();
         let mut unmatched_points: Vec<[f32; 2]> = Vec::new();
-
-        // Collect depth range for coloring
-        let mut depths: Vec<f64> = Vec::new();
-        for idx in inlier_indices.iter().chain(outlier_indices.iter()) {
-            if let Some(p_cam) = points_cam.get(*idx).and_then(|p| *p) {
-                if p_cam.z > 0.1 && p_cam.z < 100.0 {
-                    depths.push(p_cam.z);
-                }
-            }
-        }
-
-        let (depth_min, depth_max) = if !depths.is_empty() {
-            let mut sorted = depths.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            (
-                sorted[sorted.len() * 5 / 100].max(0.5),
-                sorted[sorted.len() * 95 / 100].min(20.0),
-            )
-        } else {
-            (0.5, 20.0)
-        };
 
         // Process inliers
         for &idx in inlier_indices {
             if let Some(kp) = keypoints.get(idx).ok() {
-                let pt = [kp.pt().x, kp.pt().y];
-                inlier_points.push(pt);
-
-                let color = if self.depth_coloring_enabled {
-                    if let Some(Some(p_cam)) = points_cam.get(idx) {
-                        depth_to_color(p_cam.z, depth_min, depth_max)
-                    } else {
-                        [0u8, 255, 0] // Green fallback
-                    }
-                } else {
-                    [0u8, 255, 0] // Green
-                };
-                inlier_colors.push(color);
+                inlier_points.push([kp.pt().x, kp.pt().y]);
             }
         }
 
         // Process outliers
         for &idx in outlier_indices {
             if let Some(kp) = keypoints.get(idx).ok() {
-                let pt = [kp.pt().x, kp.pt().y];
-                outlier_points.push(pt);
-
-                let color = if self.depth_coloring_enabled {
-                    if let Some(Some(p_cam)) = points_cam.get(idx) {
-                        depth_to_color(p_cam.z, depth_min, depth_max)
-                    } else {
-                        [255u8, 0, 0] // Red fallback
-                    }
-                } else {
-                    [255u8, 0, 0] // Red
-                };
-                outlier_colors.push(color);
+                outlier_points.push([kp.pt().x, kp.pt().y]);
             }
         }
 
@@ -230,26 +182,26 @@ impl RerunVisualizer {
             }
         }
 
-        // Log inliers as circles
-        if !inlier_points.is_empty() && inlier_points.len() == inlier_colors.len() {
+        // Log inliers as green dots
+        if !inlier_points.is_empty() {
             self.rec
                 .log(
                     "camera/image/inliers",
                     &rerun::Points2D::new(inlier_points)
-                        .with_colors(inlier_colors)
-                        .with_radii([6.0f32]),
+                        .with_colors([[0u8, 255, 0]]) // Green
+                        .with_radii([3.0f32]),
                 )
                 .ok();
         }
 
-        // Log outliers as triangles (using larger radius to distinguish)
-        if !outlier_points.is_empty() && outlier_points.len() == outlier_colors.len() {
+        // Log outliers as red dots
+        if !outlier_points.is_empty() {
             self.rec
                 .log(
                     "camera/image/outliers",
                     &rerun::Points2D::new(outlier_points)
-                        .with_colors(outlier_colors)
-                        .with_radii([8.0f32]),
+                        .with_colors([[255u8, 0, 0]]) // Red
+                        .with_radii([3.0f32]),
                 )
                 .ok();
         }
@@ -265,27 +217,6 @@ impl RerunVisualizer {
                 )
                 .ok();
         }
-    }
-
-    /// Log key metrics overlay on image.
-    pub fn log_image_metrics(&self, metrics: &TrackingMetrics, n_matched: usize) {
-        let metrics_text = format!(
-            "Features: {} | Matched: {} | Inliers: {} ({:.0}%) | Reproj Error: {:.2} px",
-            metrics.n_features,
-            n_matched,
-            metrics.n_inliers,
-            if metrics.n_features > 0 {
-                metrics.n_inliers as f64 / metrics.n_features as f64 * 100.0
-            } else {
-                0.0
-            },
-            metrics.reproj_error_mean_px
-        );
-
-        // Log as annotation (Rerun doesn't have direct text overlay, but we can log it separately)
-        self.rec
-            .log("camera/metrics", &rerun::TextDocument::new(metrics_text))
-            .ok();
     }
 
     /// Log current camera pose as a bright, large frustum.
@@ -341,12 +272,13 @@ impl RerunVisualizer {
             .map(|p| [p.x as f32, p.y as f32, p.z as f32])
             .collect();
 
+        // Log the trajectory as a line strip
         self.rec
             .log(
                 "world/groundtruth",
-                &rerun::LineStrips3D::new([pts])
-                    .with_colors([[0u8, 200, 100]]) // Green
-                    .with_radii([0.008f32]), // Slightly thicker than estimated
+                &rerun::LineStrips3D::new([pts.clone()])
+                    .with_colors([[0u8, 255, 0]]) // Bright pure green
+                    .with_radii([0.005f32]), // 0.5cm thick line for visibility
             )
             .ok();
     }
@@ -514,16 +446,6 @@ impl RerunVisualizer {
     pub fn fps(&self) -> f64 {
         self.last_fps
     }
-}
-
-/// Convert depth to color (blue -> green -> red gradient).
-fn depth_to_color(depth: f64, min_depth: f64, max_depth: f64) -> [u8; 3] {
-    let t = ((depth - min_depth) / (max_depth - min_depth).max(0.1)).clamp(0.0, 1.0);
-    // Blue -> Green -> Red gradient
-    let r = (t * 2.0).min(1.0);
-    let g = (1.0 - (t - 0.5).abs() * 2.0).max(0.0);
-    let b = ((1.0 - t) * 2.0).min(1.0);
-    [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
 }
 
 /// Filter points using Level-of-Detail (LOD) based on distance from camera.

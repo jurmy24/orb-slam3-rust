@@ -78,17 +78,14 @@ fn main() -> Result<()> {
             &result.matches.outlier_indices,
         );
 
-        // Image metrics overlay
-        viz.log_image_metrics(&result.metrics, result.matches.matched_map_points.len());
-
-        // 3D visualization
-        viz.log_camera_pose(&result.pose);
-        let est_trajectory: Vec<Vector3<f64>> = slam_system
-            .trajectory()
-            .iter()
-            .map(|p| p.translation)
-            .collect();
-        viz.log_trajectory(&est_trajectory);
+        // 3D visualization (commented out for testing GT only)
+        // viz.log_camera_pose(&result.pose);
+        // let est_trajectory: Vec<Vector3<f64>> = slam_system
+        //     .trajectory()
+        //     .iter()
+        //     .map(|p| p.translation)
+        //     .collect();
+        // viz.log_trajectory(&est_trajectory);
 
         // Ground truth trajectory (up to current frame time)
         // Note: We transform GT from body frame to camera frame to match SLAM coordinate system
@@ -98,26 +95,25 @@ fn main() -> Result<()> {
         // Debug output periodically
         if i % 100 == 0 {
             debug!(
-                "Frame {} (ts={}): Est trajectory: {} points, GT trajectory: {} points",
+                "Frame {} (ts={}): GT trajectory: {} points",
                 i,
                 pair.timestamp_ns,
-                est_trajectory.len(),
                 gt_positions.len()
             );
-            if !est_trajectory.is_empty() {
-                let first_est = est_trajectory.first().unwrap();
-                let last_est = est_trajectory.last().unwrap();
-                debug!(
-                    "  Est: first=[{:.2}, {:.2}, {:.2}], last=[{:.2}, {:.2}, {:.2}], dist={:.2}m",
-                    first_est.x,
-                    first_est.y,
-                    first_est.z,
-                    last_est.x,
-                    last_est.y,
-                    last_est.z,
-                    (last_est - first_est).norm()
-                );
-            }
+            // if !est_trajectory.is_empty() {
+            //     let first_est = est_trajectory.first().unwrap();
+            //     let last_est = est_trajectory.last().unwrap();
+            //     debug!(
+            //         "  Est: first=[{:.2}, {:.2}, {:.2}], last=[{:.2}, {:.2}, {:.2}], dist={:.2}m",
+            //         first_est.x,
+            //         first_est.y,
+            //         first_est.z,
+            //         last_est.x,
+            //         last_est.y,
+            //         last_est.z,
+            //         (last_est - first_est).norm()
+            //     );
+            // }
             if !gt_positions.is_empty() {
                 let first_gt = gt_positions.first().unwrap();
                 let last_gt = gt_positions.last().unwrap();
@@ -154,36 +150,37 @@ fn main() -> Result<()> {
             let shared = slam_system.shared_state();
             let atlas = shared.atlas.read();
             let map = atlas.active_map();
-            let map_id = atlas.active_map_index();
+            let _map_id = atlas.active_map_index();
             let imu_state = map.imu_init_state();
 
             // Status bar
-            viz.log_status_bar(result.state, imu_state, &result.metrics, fps);
+            let n_matched = result.matches.matched_map_points.len();
+            viz.log_status_bar(result.state, imu_state, &result.metrics, n_matched, fps);
 
             // Map ID
-            viz.log_map_id(map_id);
+            // viz.log_map_id(map_id);
 
             // Collect and log local map points
-            let local_points: Vec<Vector3<f64>> = result
-                .matches
-                .local_map_point_ids
-                .iter()
-                .filter_map(|mp_id| map.get_map_point(*mp_id).map(|mp| mp.position))
-                .collect();
-            viz.log_local_map_points(&local_points);
+            // let local_points: Vec<Vector3<f64>> = result
+            //     .matches
+            //     .local_map_point_ids
+            //     .iter()
+            //     .filter_map(|mp_id| map.get_map_point(*mp_id).map(|mp| mp.position))
+            //     .collect();
+            // viz.log_local_map_points(&local_points);
 
             // Log keyframes periodically
-            if i % 10 == 0 {
-                let keyframes: Vec<_> = map.keyframes().collect();
-                viz.log_keyframes(&keyframes);
-            }
+            // if i % 10 == 0 {
+            //     let keyframes: Vec<_> = map.keyframes().collect();
+            //     viz.log_keyframes(&keyframes);
+            // }
 
             // Full map points with LOD (less frequently)
-            if i % 5 == 0 {
-                let all_points: Vec<Vector3<f64>> =
-                    map.map_points().map(|mp| mp.position).collect();
-                viz.log_map_points_lod(&all_points, result.pose.translation);
-            }
+            // if i % 5 == 0 {
+            //     let all_points: Vec<Vector3<f64>> =
+            //         map.map_points().map(|mp| mp.position).collect();
+            //     viz.log_map_points_lod(&all_points, result.pose.translation);
+            // }
 
             // Log map statistics periodically
             if i % 100 == 0 {
