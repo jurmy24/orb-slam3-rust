@@ -11,7 +11,7 @@ use opencv::core::{KeyPoint, Vector};
 
 use crate::atlas::keyframe_db::BowVector;
 use crate::atlas::map::MapPointId;
-use crate::tracking::frame::features::FeatureSet;
+use crate::tracking::frame::FeatureSet;
 
 /// A frame being tracked (not yet a KeyFrame).
 pub struct Frame {

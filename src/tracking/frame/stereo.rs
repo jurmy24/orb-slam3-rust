@@ -1,12 +1,22 @@
 use anyhow::Result;
-use nalgebra::Vector3;
-use opencv::core::{DMatch, Mat, Vector};
-use opencv::features2d::BFMatcher;
+use nalgebra::{Point2, Vector3};
+use opencv::core::{DMatch, KeyPoint, Mat, Ptr, Vector};
+use opencv::features2d;
 use opencv::prelude::*;
-use opencv::boxed_ref::BoxedRef;
 
 use crate::tracking::frame::camera::CameraModel;
-use crate::tracking::frame::features::{FeatureDetector, FeatureSet, keypoints_to_points};
+
+/// ORB-SLAM3 matching thresholds
+pub const TH_HIGH: u32 = 100; // Max descriptor distance for acceptance
+pub const TH_LOW: u32 = 50; // Stricter threshold
+pub const NN_RATIO: f32 = 0.75; // Ratio test threshold (best/second_best)
+
+/// A set of ORB features extracted from an image.
+#[derive(Clone)]
+pub struct FeatureSet {
+    pub keypoints: Vector<KeyPoint>,
+    pub descriptors: Mat,
+}
 
 #[derive(Clone)]
 pub struct StereoFrame {
@@ -19,27 +29,29 @@ pub struct StereoFrame {
 }
 
 pub struct StereoProcessor {
-    detector: FeatureDetector,
-    matcher: BFMatcher,
+    orb: Ptr<features2d::ORB>,
     camera: CameraModel,
 }
 
 impl StereoProcessor {
     pub fn new(camera: CameraModel, n_features: i32) -> Result<Self> {
-        let detector = FeatureDetector::new(n_features)?;
-        // TODO: This might not be what ORB-SLAM3 uses/recommends, plus crossCheck=true might not be what we want
-        // Perhaps replace BFMather with candidate selection and BFMatcher... (gives ORB-SLAM3 efficiency)
-        let matcher = BFMatcher::new(opencv::core::NORM_HAMMING, false)?;
-        Ok(Self {
-            detector,
-            matcher,
-            camera,
-        })
+        let orb = features2d::ORB::create(
+            n_features,
+            1.2,
+            8,
+            31,
+            0,
+            2,
+            features2d::ORB_ScoreType::HARRIS_SCORE,
+            31,
+            20,
+        )?;
+        Ok(Self { orb, camera })
     }
 
     pub fn process(&mut self, left: &Mat, right: &Mat, timestamp_ns: u64) -> Result<StereoFrame> {
-        let left_features = self.detector.detect(left)?;
-        let right_features = self.detector.detect(right)?;
+        let left_features = self.detect_features(left)?;
+        let right_features = self.detect_features(right)?;
 
         let matches_lr = self.match_features(&left_features, &right_features)?;
         let points_cam = triangulate(&left_features, &right_features, &matches_lr, self.camera);
@@ -53,13 +65,24 @@ impl StereoProcessor {
         })
     }
 
+    fn detect_features(&mut self, image: &Mat) -> Result<FeatureSet> {
+        let mut keypoints = Vector::<KeyPoint>::new();
+        let mut descriptors = Mat::default();
+        let mask = Mat::default();
+        self.orb
+            .detect_and_compute(image, &mask, &mut keypoints, &mut descriptors, false)?;
+        Ok(FeatureSet {
+            keypoints,
+            descriptors,
+        })
+    }
+
     fn match_features(&self, left: &FeatureSet, right: &FeatureSet) -> Result<Vector<DMatch>> {
         // ORB-SLAM3 approach: For each left feature, search along epipolar line (horizontal in rectified stereo)
         // constrained by disparity min/max from baseline and depth range
 
         const MIN_DEPTH: f64 = 0.1; // meters
         const MAX_DEPTH: f64 = 40.0; // meters
-        const TH_HIGH: f32 = 100.0; // ORB descriptor distance threshold
         const VERTICAL_MARGIN: f32 = 2.0; // pixels tolerance for y-coordinate
 
         // Calculate disparity bounds from depth range
@@ -75,7 +98,8 @@ impl StereoProcessor {
 
             // Define horizontal search range based on disparity constraints
             let min_u = (ul - max_disparity).max(0.0);
-            let max_u = (ul - min_disparity).min((right.keypoints.len() as f32) * ul / left.keypoints.len() as f32);
+            let max_u = (ul - min_disparity)
+                .min((right.keypoints.len() as f32) * ul / left.keypoints.len() as f32);
 
             let mut best_dist = TH_HIGH;
             let mut best_right_idx: Option<usize> = None;
@@ -119,12 +143,14 @@ impl StereoProcessor {
 
             // Apply ratio test (Lowe's ratio)
             if let Some(right_idx) = best_right_idx {
-                if best_dist < 0.9 * second_best_dist || second_best_dist == TH_HIGH {
+                if (best_dist as f32) < 0.9 * (second_best_dist as f32)
+                    || second_best_dist == TH_HIGH
+                {
                     let dmatch = DMatch {
                         query_idx: left_idx as i32,
                         train_idx: right_idx as i32,
                         img_idx: 0,
-                        distance: best_dist,
+                        distance: best_dist as f32,
                     };
                     matches.push(dmatch);
                 }
@@ -135,19 +161,25 @@ impl StereoProcessor {
     }
 }
 
-/// Compute Hamming distance between two ORB descriptors (32-byte binary)
-fn descriptor_distance(desc1: &BoxedRef<Mat>, desc2: &BoxedRef<Mat>) -> Result<f32> {
-    // Compute Hamming distance manually by XOR-ing bytes and counting bits
+/// Compute Hamming distance between two ORB descriptors (32-byte binary).
+/// Returns the number of differing bits.
+pub fn descriptor_distance(desc1: &impl MatTraitConst, desc2: &impl MatTraitConst) -> Result<u32> {
     let mut hamming_dist = 0u32;
-
-    // ORB descriptors are typically 1 row x 32 cols (256 bits)
-    for j in 0..desc1.cols() {
+    let cols = desc1.cols().min(desc2.cols());
+    for j in 0..cols {
         let val1 = *desc1.at_2d::<u8>(0, j)?;
         let val2 = *desc2.at_2d::<u8>(0, j)?;
         hamming_dist += (val1 ^ val2).count_ones();
     }
+    Ok(hamming_dist)
+}
 
-    Ok(hamming_dist as f32)
+/// Convert OpenCV keypoints to (x, y) points in pixel coordinates (image frame)
+fn keypoints_to_points(keypoints: &Vector<KeyPoint>) -> Vec<Point2<f64>> {
+    keypoints
+        .iter()
+        .map(|kp| Point2::new(kp.pt().x as f64, kp.pt().y as f64))
+        .collect()
 }
 
 /// Triangulate 3D points from stereo matches using pinhole model.

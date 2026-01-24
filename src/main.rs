@@ -1,5 +1,6 @@
 use anyhow::Result;
 use nalgebra::Vector3;
+use tracing::{debug, info, warn};
 
 use rust_vslam::io::euroc::EurocDataset;
 use rust_vslam::system::SlamSystem;
@@ -8,25 +9,36 @@ use rust_vslam::tracking::result::TrackingResult;
 use rust_vslam::viz::rerun::RerunVisualizer;
 
 fn main() -> Result<()> {
+    // Initialize tracing subscriber with environment filter
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .init();
     let dataset_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "data/euroc/MH_01_easy/mav0".to_string());
 
-    println!("Loading EuRoC dataset from: {}", dataset_path);
     let dataset = EurocDataset::new(&dataset_path)?;
-    println!(
-        "Loaded {} stereo frames, {} IMU samples",
+    debug!(
+        "Loaded {} stereo frames, {} IMU samples, {} ground truth entries",
         dataset.len(),
-        dataset.imu_entries.len()
+        dataset.imu_entries.len(),
+        dataset.groundtruth.len()
+    );
+    // Print the camera baseline and calibration matrix
+    debug!("Camera baseline: {}", dataset.calibration.baseline);
+    debug!(
+        "Camera calibration matrix: {:?}",
+        dataset.calibration.k_left
     );
 
-    // Set up camera model
     let cam =
         CameraModel::from_k_and_baseline(dataset.calibration.k_left, dataset.calibration.baseline);
-
     let mut stereo = StereoProcessor::new(cam, 1200)?;
     let mut slam_system = SlamSystem::new(cam)?;
-    let viz = RerunVisualizer::new("rust-orb-slam3-stereo-inertial");
+    let mut viz = RerunVisualizer::new("rust-orb-slam3-stereo-inertial");
 
     // Iterates over stereo frames (not IMU samples!)
     for i in 0..dataset.len() {
@@ -51,49 +63,129 @@ fn main() -> Result<()> {
 
         // Log everything to Rerun
         viz.set_time(pair.timestamp_ns);
-        viz.log_stereo_frame(&stereo_frame, &pair.left, &pair.right);
-        viz.log_pose(&result.pose);
-        viz.log_trajectory(
-            &slam_system
-                .trajectory()
-                .iter()
-                .map(|p| p.translation)
-                .collect::<Vec<Vector3<f64>>>(),
+
+        // Status bar (needs FPS before map access)
+        let fps = viz.fps();
+
+        // Image feed (doesn't need map access)
+        viz.log_image_feed(&pair.left);
+
+        // Annotated features
+        viz.log_annotated_features(
+            &stereo_frame,
+            &result.matches,
+            &result.matches.inlier_indices,
+            &result.matches.outlier_indices,
         );
-        viz.log_tracking_metrics(&result.metrics);
-        viz.log_timing(&result.timing);
 
-        // Log tracking state with map info
-        {
-            let shared = slam_system.shared_state();
-            let atlas = shared.atlas.read();
-            viz.log_tracking_state(result.state, i, atlas.active_map_index());
+        // 3D visualization
+        viz.log_camera_pose(&result.pose);
+        let est_trajectory: Vec<Vector3<f64>> = slam_system
+            .trajectory()
+            .iter()
+            .map(|p| p.translation)
+            .collect();
+        viz.log_trajectory(&est_trajectory);
 
-            // Log map statistics periodically
-            if i % 100 == 0 {
-                let map = atlas.active_map();
-                println!(
-                    "Frame {}/{}: {} keyframes, {} map points, state={:?}",
-                    i,
-                    dataset.len(),
-                    map.num_keyframes(),
-                    map.num_map_points(),
-                    result.state
+        // Ground truth trajectory (up to current frame time)
+        // Note: We transform GT from body frame to camera frame to match SLAM coordinate system
+        let gt_positions = dataset.groundtruth_positions_until(pair.timestamp_ns);
+        viz.log_groundtruth_trajectory(&gt_positions);
+
+        // Debug output periodically
+        if i % 100 == 0 {
+            debug!(
+                "Frame {} (ts={}): Est trajectory: {} points, GT trajectory: {} points",
+                i,
+                pair.timestamp_ns,
+                est_trajectory.len(),
+                gt_positions.len()
+            );
+            if !est_trajectory.is_empty() {
+                let first_est = est_trajectory.first().unwrap();
+                let last_est = est_trajectory.last().unwrap();
+                debug!(
+                    "  Est: first=[{:.2}, {:.2}, {:.2}], last=[{:.2}, {:.2}, {:.2}], dist={:.2}m",
+                    first_est.x,
+                    first_est.y,
+                    first_est.z,
+                    last_est.x,
+                    last_est.y,
+                    last_est.z,
+                    (last_est - first_est).norm()
                 );
             }
         }
 
-        // Log map points for visualization
-        if i % 10 == 0 {
+        // Temporal plots
+        viz.log_temporal_plots(&result.metrics, &result.timing);
+        viz.log_bias_magnitude(result.imu_bias.as_ref());
+
+        // Get map state for visualization (keeping atlas lock scoped)
+        {
             let shared = slam_system.shared_state();
             let atlas = shared.atlas.read();
             let map = atlas.active_map();
-            let points: Vec<Vector3<f64>> = map.map_points().map(|mp| mp.position).collect();
-            viz.log_map_points(&points);
+            let map_id = atlas.active_map_index();
+            let imu_state = map.imu_init_state();
+
+            // Status bar
+            let n_matched = result.matches.matched_map_points.len();
+            viz.log_status_bar(result.state, imu_state, &result.metrics, n_matched, fps);
+
+            // Map ID
+            viz.log_map_id(map_id);
+
+            // Collect and log local map points
+            let local_points: Vec<Vector3<f64>> = result
+                .matches
+                .local_map_point_ids
+                .iter()
+                .filter_map(|mp_id| map.get_map_point(*mp_id).map(|mp| mp.position))
+                .collect();
+            viz.log_local_map_points(&local_points);
+
+            // Log keyframes periodically
+            if i % 10 == 0 {
+                let keyframes: Vec<_> = map.keyframes().collect();
+                viz.log_keyframes(&keyframes);
+
+                // Debug: log keyframe poses every 100 frames
+                if i % 100 == 0 && !keyframes.is_empty() {
+                    debug!("Keyframe poses ({} total):", keyframes.len());
+                    for kf in keyframes.iter().take(5) {
+                        let t = &kf.pose.translation;
+                        debug!("  KF {}: pos=[{:.3}, {:.3}, {:.3}]", kf.id.0, t.x, t.y, t.z);
+                    }
+                    if keyframes.len() > 5 {
+                        debug!("  ... and {} more keyframes", keyframes.len() - 5);
+                    }
+                }
+            }
+
+            // Full map points with LOD (less frequently)
+            if i % 5 == 0 {
+                let all_points: Vec<Vector3<f64>> =
+                    map.map_points().map(|mp| mp.position).collect();
+                viz.log_map_points_lod(&all_points, result.pose.translation);
+            }
+
+            // Log map statistics periodically
+            if i % 100 == 0 {
+                info!(
+                    "Frame {}/{}: {} keyframes, {} map points, state={:?}, IMU={:?}",
+                    i,
+                    dataset.len(),
+                    map.num_keyframes(),
+                    map.num_map_points(),
+                    result.state,
+                    imu_state
+                );
+            }
         }
     }
 
-    println!("Done! Processed {} frames", dataset.len());
+    info!("Done! Processed {} frames", dataset.len());
 
     // Shutdown cleanly (joins Local Mapping thread)
     slam_system.shutdown();

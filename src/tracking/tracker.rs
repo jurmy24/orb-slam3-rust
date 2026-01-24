@@ -17,20 +17,20 @@ use nalgebra::Vector3;
 use opencv::core::{Mat, Point2f, Vector};
 use opencv::features2d::BFMatcher;
 use opencv::prelude::*;
+use tracing::{debug, error};
 
 use crate::atlas::keyframe_db::BowVector;
 use crate::atlas::map::{KeyFrameId, MapPointId};
-use crate::geometry::{solve_pnp_ransac_detailed, SE3};
+use crate::geometry::{SE3, solve_pnp_ransac_detailed};
 use crate::imu::{ImuBias, ImuNoise, Preintegrator};
 use crate::io::euroc::ImuEntry;
 use crate::system::messages::NewKeyFrameMsg;
 use crate::system::shared_state::SharedState;
-use crate::tracking::frame::{CameraModel, StereoFrame};
+use crate::tracking::TrackingState;
+use crate::tracking::frame::{CameraModel, NN_RATIO, StereoFrame, TH_HIGH, descriptor_distance};
 use crate::tracking::keyframe_decision::KeyFrameDecision;
-use crate::tracking::matching::{descriptor_distance, NN_RATIO, TH_HIGH};
 use crate::tracking::result::{MatchInfo, TimingStats, TrackingMetrics, TrackingResult};
 use crate::tracking::tracking_frame::Frame;
-use crate::tracking::TrackingState;
 
 /// Time threshold for transitioning from RECENTLY_LOST to LOST (seconds).
 const TIME_RECENTLY_LOST_THRESHOLD: f64 = 5.0;
@@ -178,7 +178,10 @@ impl Tracker {
         // --- Map initialization or tracking ---
         let n_inliers: usize;
         let matched_map_points: Vec<Option<MapPointId>>;
-        let mut tracking_ok = false;
+        let mut reproj_errors: Vec<f64> = Vec::new();
+        let mut inlier_indices: Vec<usize> = Vec::new();
+        let mut outlier_indices: Vec<usize> = Vec::new();
+        let tracking_ok;
 
         // Check if the active map needs initialization
         let needs_init = {
@@ -198,9 +201,13 @@ impl Tracker {
             match self.state {
                 TrackingState::Ok | TrackingState::NotInitialized => {
                     // Normal tracking: reference KF + local map
-                    let (inliers, matches) = self.track_normal(&frame, &imu_prior)?;
+                    let (inliers, matches, reproj_errs, inlier_idx, outlier_idx) =
+                        self.track_normal(&frame, &imu_prior)?;
                     n_inliers = inliers;
                     matched_map_points = matches;
+                    reproj_errors = reproj_errs;
+                    inlier_indices = inlier_idx;
+                    outlier_indices = outlier_idx;
                     tracking_ok = n_inliers >= MIN_INLIERS_OK;
 
                     // Try to create keyframe even with weak tracking (helps map growth)
@@ -218,9 +225,13 @@ impl Tracker {
                 TrackingState::RecentlyLost => {
                     // IMU-only prediction while recently lost
                     // Try to recover with visual tracking
-                    let (inliers, matches) = self.track_normal(&frame, &imu_prior)?;
+                    let (inliers, matches, reproj_errs, inlier_idx, outlier_idx) =
+                        self.track_normal(&frame, &imu_prior)?;
                     n_inliers = inliers;
                     matched_map_points = matches;
+                    reproj_errors = reproj_errs;
+                    inlier_indices = inlier_idx;
+                    outlier_indices = outlier_idx;
                     tracking_ok = n_inliers >= MIN_INLIERS_OK;
 
                     // For stereo-inertial: create keyframes even when RECENTLY_LOST
@@ -277,6 +288,9 @@ impl Tracker {
         self.velocity = pred_vel;
         self.trajectory.push(self.pose.clone());
 
+        // Compute IMU preintegration residual
+        let imu_residual = (imu_prior.translation - self.pose.translation).norm();
+
         // Build metrics
         let n_features = frame.features.keypoints.len();
         let n_map_point_matches = n_inliers;
@@ -286,17 +300,51 @@ impl Tracker {
             0.0
         };
 
+        // Compute reprojection error statistics
+        let reproj_error_median_px = if !reproj_errors.is_empty() {
+            let mut sorted_errors = reproj_errors.clone();
+            sorted_errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted_errors[sorted_errors.len() / 2]
+        } else {
+            0.0
+        };
+
+        let reproj_error_mean_px = if !reproj_errors.is_empty() {
+            reproj_errors.iter().sum::<f64>() / reproj_errors.len() as f64
+        } else {
+            0.0
+        };
+
         let delta_t = (self.pose.translation - prev_pose.translation).norm();
         let dq = prev_pose.rotation.inverse() * self.pose.rotation;
         let delta_rot_rad = dq.angle();
         let delta_rot_deg = delta_rot_rad.to_degrees();
+
+        // Get IMU bias from preintegrator
+        let imu_bias = Some(self.preintegrator.bias);
+
+        // Get local map point IDs for visualization
+        let local_map_point_ids = {
+            let atlas = self.shared.atlas.read();
+            let map = atlas.active_map();
+            if let Some(ref_kf) = self.reference_kf {
+                let local_kfs = map.get_local_keyframes_readonly(ref_kf, 10);
+                map.get_map_points_from_keyframes(&local_kfs)
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
 
         let metrics = TrackingMetrics {
             n_features,
             n_map_point_matches,
             n_inliers,
             inlier_ratio,
-            reproj_error_median_px: 0.0,
+            reproj_error_median_px,
+            reproj_error_mean_px,
+            imu_preint_residual_m: imu_residual,
             delta_translation_m: delta_t,
             delta_rotation_deg: delta_rot_deg,
         };
@@ -304,12 +352,19 @@ impl Tracker {
         let mut timing = TimingStats::zero();
         timing.total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
 
+        // Build matched map points list for MatchInfo
+        let matched_map_points_list: Vec<(MapPointId, usize)> = matched_map_points
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, mp_id_opt)| mp_id_opt.map(|mp_id| (mp_id, idx)))
+            .collect();
+
         let matches = MatchInfo {
-            matched_map_points: Vec::new(),
-            inlier_indices: Vec::new(),
-            outlier_indices: Vec::new(),
-            reproj_errors: Vec::new(),
-            local_map_point_ids: Vec::new(),
+            matched_map_points: matched_map_points_list,
+            inlier_indices,
+            outlier_indices,
+            reproj_errors,
+            local_map_point_ids,
         };
 
         Ok(TrackingResult {
@@ -320,6 +375,7 @@ impl Tracker {
             metrics,
             timing,
             matches,
+            imu_bias,
         })
     }
 
@@ -333,7 +389,13 @@ impl Tracker {
         &mut self,
         frame: &Frame,
         imu_prior: &SE3,
-    ) -> Result<(usize, Vec<Option<MapPointId>>)> {
+    ) -> Result<(
+        usize,
+        Vec<Option<MapPointId>>,
+        Vec<f64>,
+        Vec<usize>,
+        Vec<usize>,
+    )> {
         // Stage 1: Initial pose estimation
         // Try motion model first (if we have velocity), then fall back to reference KF
         let initial_pose = {
@@ -361,13 +423,19 @@ impl Tracker {
         self.pose = initial_pose.clone();
 
         // Stage 2: Refine pose by tracking the local map
-        let (estimated_pose, inliers, matches) = {
+        let (estimated_pose, inliers, matches, reproj_errors, inlier_indices, outlier_indices) = {
             let atlas = self.shared.atlas.read();
             self.track_local_map(&atlas, frame, &initial_pose)?
         };
         self.pose = estimated_pose;
 
-        Ok((inliers, matches))
+        Ok((
+            inliers,
+            matches,
+            reproj_errors,
+            inlier_indices,
+            outlier_indices,
+        ))
     }
 
     /// Handle LOST state: create new map or reset current map.
@@ -379,7 +447,7 @@ impl Tracker {
 
         if num_keyframes < MIN_KEYFRAMES_FOR_NEW_MAP {
             // Too few keyframes - reset current map
-            eprintln!(
+            error!(
                 "Tracking LOST with {} keyframes - resetting active map",
                 num_keyframes
             );
@@ -387,7 +455,7 @@ impl Tracker {
             atlas.reset_active_map();
         } else {
             // Enough keyframes - create new map (old map preserved for potential merging)
-            eprintln!("Tracking LOST - creating new map in Atlas");
+            error!("Tracking LOST - creating new map in Atlas");
             let mut atlas = self.shared.atlas.write();
             atlas.create_new_map();
         }
@@ -598,13 +666,20 @@ impl Tracker {
 
     /// Track the local map by projecting MapPoints into the current frame and solving PnP.
     ///
-    /// Returns (pose, n_inliers, matched_map_points).
+    /// Returns (pose, n_inliers, matched_map_points, reproj_errors, inlier_indices, outlier_indices).
     fn track_local_map(
         &self,
         atlas: &crate::atlas::atlas::Atlas,
         frame: &Frame,
         imu_prior: &SE3,
-    ) -> Result<(SE3, usize, Vec<Option<MapPointId>>)> {
+    ) -> Result<(
+        SE3,
+        usize,
+        Vec<Option<MapPointId>>,
+        Vec<f64>,
+        Vec<usize>,
+        Vec<usize>,
+    )> {
         let map = atlas.active_map();
         let mut matched_map_points: Vec<Option<MapPointId>> = vec![None; frame.num_features()];
 
@@ -627,7 +702,14 @@ impl Tracker {
 
         let local_kfs: Vec<KeyFrameId> = k1.union(&k2).copied().collect();
         if local_kfs.is_empty() {
-            return Ok((imu_prior.clone(), 0, matched_map_points));
+            return Ok((
+                imu_prior.clone(),
+                0,
+                matched_map_points,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ));
         }
 
         // Collect local MapPoints
@@ -711,7 +793,7 @@ impl Tracker {
         let n_corr = pts3d.len();
 
         if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-            eprintln!(
+            debug!(
                 "[track_local_map] frame={} local_kfs={} local_mps={} correspondences={}",
                 self.frame_count,
                 local_kfs.len(),
@@ -721,7 +803,14 @@ impl Tracker {
         }
 
         if n_corr < 4 {
-            return Ok((imu_prior.clone(), n_corr, matched_map_points));
+            return Ok((
+                imu_prior.clone(),
+                n_corr,
+                matched_map_points,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ));
         }
 
         let pnp = solve_pnp_ransac_detailed(&pts3d, &pts2d, &self.camera, Some(imu_prior))
@@ -731,21 +820,40 @@ impl Tracker {
                 reproj_errors: Vec::new(),
             });
 
-        // Record which map points were matched (inliers only)
+        // Record which map points were matched (inliers only) and collect inlier/outlier indices
+        let mut inlier_indices = Vec::new();
+        let mut outlier_indices = Vec::new();
+        let mut reproj_errors_full = vec![f64::INFINITY; mp_indices.len()];
+
         for (i, &is_inlier) in pnp.inlier_mask.iter().enumerate() {
-            if is_inlier && i < mp_indices.len() {
+            if i < mp_indices.len() {
                 let (mp_id, feat_idx) = mp_indices[i];
-                matched_map_points[feat_idx] = Some(mp_id);
+                if i < pnp.reproj_errors.len() {
+                    reproj_errors_full[i] = pnp.reproj_errors[i];
+                }
+                if is_inlier {
+                    matched_map_points[feat_idx] = Some(mp_id);
+                    inlier_indices.push(i);
+                } else {
+                    outlier_indices.push(i);
+                }
             }
         }
 
         let n_inliers = pnp.inlier_mask.iter().filter(|&&b| b).count();
 
         if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-            eprintln!("[track_local_map] pnp_inliers={}", n_inliers);
+            debug!("[track_local_map] pnp_inliers={}", n_inliers);
         }
 
-        Ok((pnp.pose, n_inliers, matched_map_points))
+        Ok((
+            pnp.pose,
+            n_inliers,
+            matched_map_points,
+            reproj_errors_full,
+            inlier_indices,
+            outlier_indices,
+        ))
     }
 
     /// Initial pose estimation via reference keyframe tracking.
@@ -799,7 +907,7 @@ impl Tracker {
         }
 
         if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-            eprintln!(
+            debug!(
                 "[track_ref_kf] frame={} total_matches={} matches_with_mp={} pts3d={}",
                 self.frame_count,
                 total_matches,
@@ -816,7 +924,7 @@ impl Tracker {
         if let Ok(ref res) = result {
             let n_inliers = res.inlier_mask.iter().filter(|&&b| b).count();
             if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-                eprintln!("[track_ref_kf] pnp_inliers={}", n_inliers);
+                debug!("[track_ref_kf] pnp_inliers={}", n_inliers);
             }
         }
 
@@ -850,7 +958,7 @@ impl Tracker {
         // Search radius for stereo (in pixels)
         let search_radius: f64 = 15.0;
 
-        for (feat_idx, mp_id_opt) in self.last_frame_map_points.iter().enumerate() {
+        for (_feat_idx, mp_id_opt) in self.last_frame_map_points.iter().enumerate() {
             let mp_id = match mp_id_opt {
                 Some(id) => *id,
                 None => continue,
@@ -925,7 +1033,7 @@ impl Tracker {
         }
 
         if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-            eprintln!(
+            debug!(
                 "[track_motion] frame={} prev_mps={} correspondences={}",
                 self.frame_count,
                 self.last_frame_map_points
@@ -947,7 +1055,7 @@ impl Tracker {
         if let Ok(ref res) = result {
             let n_inliers = res.inlier_mask.iter().filter(|&&b| b).count();
             if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-                eprintln!("[track_motion] pnp_inliers={}", n_inliers);
+                debug!("[track_motion] pnp_inliers={}", n_inliers);
             }
             // Only accept if we have enough inliers
             if n_inliers < 10 {

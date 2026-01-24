@@ -13,9 +13,10 @@
 use std::sync::Arc;
 
 use nalgebra::{UnitQuaternion, Vector3};
+use tracing::info;
 
 use crate::atlas::map::KeyFrameId;
-use crate::imu::ImuBias;
+use crate::imu::{ImuBias, ImuInitState};
 use crate::system::shared_state::SharedState;
 
 /// Minimum number of keyframes required for IMU initialization.
@@ -50,12 +51,17 @@ pub struct ImuInitResult {
 /// 2. Keyframe velocities
 /// 3. Initial bias estimate (can be zero initially)
 pub fn initialize_imu(shared: &Arc<SharedState>) -> Option<ImuInitResult> {
-    let atlas = shared.atlas.read();
-    let map = atlas.active_map();
+    let mut atlas = shared.atlas.write();
+    let map = atlas.active_map_mut();
 
     // Check if already initialized
     if map.is_imu_initialized() {
         return None;
+    }
+
+    // Set state to INITIALIZING when we start the attempt
+    if matches!(map.imu_init_state(), ImuInitState::NotInitialized) {
+        map.set_imu_init_state(ImuInitState::Initializing);
     }
 
     // Check minimum keyframes
@@ -63,15 +69,34 @@ pub fn initialize_imu(shared: &Arc<SharedState>) -> Option<ImuInitResult> {
         return None;
     }
 
-    // Get keyframes in temporal order
-    let keyframes = map.keyframes_temporal_order();
-    if keyframes.len() < MIN_KEYFRAMES_FOR_INIT {
-        return None;
-    }
-
     // Check minimum time span
     let time_span = map.time_span_seconds();
     if time_span < MIN_TIME_SPAN_STEREO {
+        return None;
+    }
+
+    // Get keyframes in temporal order (need to clone IDs since we'll drop the lock)
+    let keyframe_ids: Vec<KeyFrameId> = map
+        .keyframes_temporal_order()
+        .iter()
+        .map(|kf| kf.id)
+        .collect();
+    if keyframe_ids.len() < MIN_KEYFRAMES_FOR_INIT {
+        return None;
+    }
+
+    // Drop write lock and get read lock to access keyframe data
+    drop(atlas);
+    let atlas = shared.atlas.read();
+    let map = atlas.active_map();
+
+    // Get keyframes by ID
+    let keyframes: Vec<_> = keyframe_ids
+        .iter()
+        .filter_map(|&id| map.get_keyframe(id))
+        .collect();
+
+    if keyframes.len() < MIN_KEYFRAMES_FOR_INIT {
         return None;
     }
 
@@ -192,9 +217,9 @@ pub fn apply_imu_init(shared: &Arc<SharedState>, result: &ImuInitResult) {
     }
 
     // Mark IMU as initialized
-    map.set_imu_initialized();
+    map.set_imu_init_state(ImuInitState::Initialized);
 
-    eprintln!(
+    info!(
         "IMU initialized! Gravity direction estimated from {} keyframes over {:.2}s",
         map.num_keyframes(),
         map.time_span_seconds()

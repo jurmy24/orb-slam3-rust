@@ -10,6 +10,7 @@ use nalgebra::Vector3;
 
 use crate::atlas::map::{KeyFrameId, MapPointId};
 use crate::geometry::SE3;
+use crate::imu::ImuBias;
 use crate::tracking::TrackingState;
 
 /// Summary of tracking for a single frame.
@@ -21,6 +22,8 @@ pub struct TrackingResult {
     pub metrics: TrackingMetrics,
     pub timing: TimingStats,
     pub matches: MatchInfo,
+    /// Current IMU bias estimate (if available).
+    pub imu_bias: Option<ImuBias>,
 }
 
 /// Scalar metrics useful for debugging tracking quality.
@@ -30,6 +33,8 @@ pub struct TrackingMetrics {
     pub n_inliers: usize,
     pub inlier_ratio: f64,
     pub reproj_error_median_px: f64,
+    pub reproj_error_mean_px: f64,
+    pub imu_preint_residual_m: f64,
     pub delta_translation_m: f64,
     pub delta_rotation_deg: f64,
 }

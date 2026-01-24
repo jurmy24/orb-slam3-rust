@@ -18,6 +18,7 @@ use nalgebra::Vector3;
 use opencv::core::{KeyPoint, Mat, Vector};
 
 use crate::geometry::SE3;
+use crate::imu::ImuInitState;
 use crate::tracking::frame::CameraModel;
 
 use super::keyframe::KeyFrame;
@@ -44,8 +45,8 @@ pub struct Map {
     /// Number of ORB pyramid levels (typically 8).
     orb_num_levels: u32,
 
-    /// Whether IMU has been initialized for this map.
-    imu_initialized: bool,
+    /// IMU initialization state for this map.
+    imu_init_state: ImuInitState,
 
     /// Whether first visual-inertial BA has been done.
     inertial_ba1_done: bool,
@@ -69,7 +70,7 @@ impl Map {
             next_mp_id: 0,
             orb_scale_factor: 1.2,
             orb_num_levels: 8,
-            imu_initialized: false,
+            imu_init_state: ImuInitState::NotInitialized,
             inertial_ba1_done: false,
             inertial_ba2_done: false,
             last_keyframe_id: None,
@@ -89,14 +90,24 @@ impl Map {
     // IMU Initialization State
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Check if IMU has been initialized for this map.
-    pub fn is_imu_initialized(&self) -> bool {
-        self.imu_initialized
+    /// Get the current IMU initialization state.
+    pub fn imu_init_state(&self) -> ImuInitState {
+        self.imu_init_state
     }
 
-    /// Set IMU as initialized.
+    /// Check if IMU has been initialized for this map.
+    pub fn is_imu_initialized(&self) -> bool {
+        matches!(self.imu_init_state, ImuInitState::Initialized)
+    }
+
+    /// Set IMU initialization state (called by Local Mapping).
+    pub fn set_imu_init_state(&mut self, state: ImuInitState) {
+        self.imu_init_state = state;
+    }
+
+    /// Set IMU as initialized (backward compatibility).
     pub fn set_imu_initialized(&mut self) {
-        self.imu_initialized = true;
+        self.imu_init_state = ImuInitState::Initialized;
     }
 
     /// Check if first visual-inertial BA has been done.
