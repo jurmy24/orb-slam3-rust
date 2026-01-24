@@ -28,6 +28,7 @@ use std::collections::HashSet;
 use tracing::warn;
 
 use crate::atlas::map::KeyFrame;
+use crate::geometry::frames::{camera_pose_to_viz, camera_position_to_viz};
 use crate::geometry::SE3;
 use crate::imu::ImuInitState;
 use crate::tracking::TrackingState;
@@ -59,8 +60,18 @@ impl RerunVisualizer {
         }
 
         // Set up coordinate system for world frame visualization
-        // EuRoC uses Z-up world frame, so we use Right-Forward-Up (X=right, Y=forward, Z=up)
-        rec.log_static("world", &rerun::ViewCoordinates::RFU()).ok();
+        // Set z-up world frame where z is the upward direction (from ground)
+        rec.log_static("world", &rerun::ViewCoordinates::FLU()).ok();
+        // Set camera frame to x-right, y-down, z-forward (optical axis)
+        rec.log_static("world/camera", &rerun::ViewCoordinates::RDF())
+            .ok();
+        // rec.log_static(
+        //     "world/camera/view_direction",
+        //     &rerun::ViewCoordinates::RDF(),
+        // )
+        // .ok();
+        // rec.log_static("world/groundtruth", &rerun::ViewCoordinates::FLU())
+        //     .ok();
 
         Self {
             rec,
@@ -219,18 +230,27 @@ impl RerunVisualizer {
         }
     }
 
-    /// Log current camera pose as a bright, large frustum.
+    /// Log current camera pose as a frustum with viewing direction arrow.
+    ///
+    /// The input pose is T_wc (camera-to-world in SLAM coordinates).
+    /// We convert it to visualization frame (FLU) where:
+    /// - X is forward
+    /// - Y is left
+    /// - Z is up
     pub fn log_camera_pose(&self, pose: &SE3) {
+        // Convert from SLAM camera frame to visualization frame
+        let viz_pose = camera_pose_to_viz(pose);
+
         let translation = glam::Vec3::new(
-            pose.translation.x as f32,
-            pose.translation.y as f32,
-            pose.translation.z as f32,
+            viz_pose.translation.x as f32,
+            viz_pose.translation.y as f32,
+            viz_pose.translation.z as f32,
         );
         let rotation = glam::Quat::from_xyzw(
-            pose.rotation.coords.x as f32,
-            pose.rotation.coords.y as f32,
-            pose.rotation.coords.z as f32,
-            pose.rotation.w as f32,
+            viz_pose.rotation.coords.x as f32,
+            viz_pose.rotation.coords.y as f32,
+            viz_pose.rotation.coords.z as f32,
+            viz_pose.rotation.w as f32,
         );
 
         // Log as transform (Rerun will visualize as camera frustum)
@@ -240,16 +260,44 @@ impl RerunVisualizer {
                 &rerun::Transform3D::from_translation_rotation(translation, rotation),
             )
             .ok();
+
+        // Add viewing direction arrow (points along +X in viz frame, which is forward)
+        let forward_viz = Vector3::new(1.0, 0.0, 0.0); // +X in viz frame (forward)
+        let forward_world = viz_pose.rotation * forward_viz; // Rotate to world frame
+
+        self.rec
+            .log(
+                "world/camera/view_direction",
+                &rerun::Arrows3D::from_vectors([[
+                    (forward_world.x * 0.5) as f32,
+                    (forward_world.y * 0.5) as f32,
+                    (forward_world.z * 0.5) as f32,
+                ]])
+                .with_origins([[
+                    viz_pose.translation.x as f32,
+                    viz_pose.translation.y as f32,
+                    viz_pose.translation.z as f32,
+                ]])
+                .with_colors([[0u8, 255, 0]]) // Green arrow
+                .with_radii([0.01f32]),
+            )
+            .ok();
     }
 
     /// Log trajectory as a thin gray line.
+    ///
+    /// Input positions are in SLAM camera frame coordinates.
+    /// We convert them to visualization frame (FLU).
     pub fn log_trajectory(&self, positions: &[Vector3<f64>]) {
         if positions.len() < 2 {
             return;
         }
         let pts: Vec<[f32; 3]> = positions
             .iter()
-            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
+            .map(|p| {
+                let viz_p = camera_position_to_viz(p);
+                [viz_p.x as f32, viz_p.y as f32, viz_p.z as f32]
+            })
             .collect();
 
         self.rec
@@ -263,6 +311,9 @@ impl RerunVisualizer {
     }
 
     /// Log ground truth trajectory as a green line (grows over time).
+    ///
+    /// Input positions are already transformed to visualization frame (FLU)
+    /// by the EurocDataset::groundtruth_positions_until method.
     pub fn log_groundtruth_trajectory(&self, positions: &[Vector3<f64>]) {
         if positions.len() < 2 {
             return;
@@ -284,10 +335,15 @@ impl RerunVisualizer {
     }
 
     /// Log keyframes as small blue boxes.
+    ///
+    /// Keyframe poses are in SLAM camera frame coordinates (T_wc).
+    /// We convert them to visualization frame (FLU).
     pub fn log_keyframes(&self, keyframes: &[&KeyFrame]) {
         for kf in keyframes {
-            let t = &kf.pose.translation;
-            let q = &kf.pose.rotation;
+            // Convert keyframe pose to visualization frame
+            let viz_pose = camera_pose_to_viz(&kf.pose);
+            let t = &viz_pose.translation;
+            let q = &viz_pose.rotation;
             let translation = glam::Vec3::new(t.x as f32, t.y as f32, t.z as f32);
             let rotation = glam::Quat::from_xyzw(
                 q.coords.x as f32,
@@ -296,7 +352,7 @@ impl RerunVisualizer {
                 q.w as f32,
             );
 
-            // Log as transform - Rerun can visualize as boxes
+            // Log as transform - positions the keyframe in world space
             let path = format!("world/keyframes/{}", kf.id.0);
             self.rec
                 .log(
@@ -305,14 +361,15 @@ impl RerunVisualizer {
                 )
                 .ok();
 
-            // Also log as a small box at the camera center
+            // Log box at local origin [0,0,0] - the parent transform positions it correctly
+            // (Previously used world coordinates which caused double-transformation)
             let box_path = format!("world/keyframes/{}/box", kf.id.0);
             self.rec
                 .log(
                     box_path.as_str(),
                     &rerun::Boxes3D::from_centers_and_sizes(
-                        [[translation.x, translation.y, translation.z]],
-                        [[0.1f32, 0.1, 0.1]],
+                        [[0.0f32, 0.0, 0.0]],    // Local coordinates (origin of keyframe)
+                        [[0.05f32, 0.05, 0.05]], // Slightly larger for visibility
                     )
                     .with_colors([[0u8, 100, 255]]), // Blue
                 )
@@ -321,13 +378,19 @@ impl RerunVisualizer {
     }
 
     /// Log local map points (white dots).
+    ///
+    /// Map points are in SLAM world frame (which uses camera conventions).
+    /// We convert them to visualization frame (FLU).
     pub fn log_local_map_points(&self, points: &[Vector3<f64>]) {
         if points.is_empty() {
             return;
         }
         let pts: Vec<[f32; 3]> = points
             .iter()
-            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
+            .map(|p| {
+                let viz_p = camera_position_to_viz(p);
+                [viz_p.x as f32, viz_p.y as f32, viz_p.z as f32]
+            })
             .collect();
 
         self.rec
@@ -341,12 +404,15 @@ impl RerunVisualizer {
     }
 
     /// Log full map points with LOD filtering (dim, semi-transparent).
+    ///
+    /// Map points and camera position are in SLAM world frame (camera conventions).
+    /// We convert them to visualization frame (FLU).
     pub fn log_map_points_lod(&self, points: &[Vector3<f64>], camera_pos: Vector3<f64>) {
         if points.is_empty() {
             return;
         }
 
-        // Apply LOD filtering
+        // Apply LOD filtering (in original frame, before conversion)
         let filtered_points = filter_points_lod(points, camera_pos, 10.0, 50.0, 10);
 
         if filtered_points.is_empty() {
@@ -355,7 +421,10 @@ impl RerunVisualizer {
 
         let pts: Vec<[f32; 3]> = filtered_points
             .iter()
-            .map(|p| [p.x as f32, p.y as f32, p.z as f32])
+            .map(|p| {
+                let viz_p = camera_position_to_viz(p);
+                [viz_p.x as f32, viz_p.y as f32, viz_p.z as f32]
+            })
             .collect();
 
         // Dim, semi-transparent points

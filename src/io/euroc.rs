@@ -141,12 +141,13 @@ impl EurocDataset {
     }
 
     /// Get ground truth positions up to (and including) the given timestamp.
-    /// Transforms from body/IMU frame to camera frame (cam0) and aligns to SLAM origin.
+    /// Returns positions aligned to SLAM visualization frame.
     /// Uses binary search for O(log n) lookup instead of O(n) scan.
     ///
-    /// Note: GT pose is body pose in reference/world frame. We transform the full pose
-    /// from body to camera: T_world_cam = T_world_body * T_body_cam = T_world_body * T_cam0_body^-1
-    /// Then we subtract the first GT position so trajectories are origin-aligned.
+    /// EuRoC ground truth is in the Vicon/Leica reference frame, which typically has Z-up.
+    /// We transform it to match the SLAM visualization:
+    /// 1. Translate so first GT position is at origin
+    /// 2. Rotate from GT reference frame to match SLAM visualization frame
     ///
     /// Downsamples from 200Hz (IMU rate) to ~20Hz (camera rate) for visualization efficiency.
     pub fn groundtruth_positions_until(&self, timestamp_ns: u64) -> Vec<Vector3<f64>> {
@@ -154,12 +155,18 @@ impl EurocDataset {
             return Vec::new();
         }
 
-        // Transform from body frame to camera frame: T_cam0_body
-        // GT pose is T_world_body, we need T_world_cam = T_world_body * T_body_cam0
-        let t_body_cam0 = self.calibration.t_cam0_body.inverse();
+        let first_gt_pos = self.groundtruth[0].pose.translation;
 
-        // Get the first GT position (to align with SLAM origin)
-        let first_gt_cam = self.groundtruth[0].pose.compose(&t_body_cam0).translation;
+        // Debug: log the first GT position (only once)
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!(
+                "GT first position: [{:.3}, {:.3}, {:.3}]",
+                first_gt_pos.x,
+                first_gt_pos.y,
+                first_gt_pos.z
+            );
+        }
 
         // Use binary search to find the cutoff point efficiently
         let cutoff_idx = self
@@ -173,11 +180,9 @@ impl EurocDataset {
             .iter()
             .step_by(DOWNSAMPLE_FACTOR)
             .map(|gt| {
-                // Transform full pose from body to camera, then extract camera position in world frame
-                // T_world_cam = T_world_body * T_body_cam0
-                let t_world_cam = gt.pose.compose(&t_body_cam0);
-                // Subtract first position to align with SLAM origin
-                t_world_cam.translation - first_gt_cam
+                // Translate so first position is at origin
+                // EuRoC Vicon frame is already Z-up, which matches our viz frame
+                gt.pose.translation - first_gt_pos
             })
             .collect()
     }

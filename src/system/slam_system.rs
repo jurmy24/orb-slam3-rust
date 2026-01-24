@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::io::euroc::ImuEntry;
 use crate::local_mapping::LocalMapper;
+use crate::tracking::Tracker;
 use crate::tracking::frame::{CameraModel, StereoFrame};
 use crate::tracking::result::TrackingResult;
-use crate::tracking::Tracker;
 
 use super::messages::NewKeyFrameMsg;
 use super::shared_state::SharedState;

@@ -601,20 +601,20 @@ fn compute_jacobians_cw(
     // Columns: [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z]
     // =========================================================================
     // Row 0 (u/x error derivative)
-    let j00 = x * y * invz2 * fx;                    // d(u_err)/d(rot_x)
-    let j01 = -(1.0 + x * x * invz2) * fx;           // d(u_err)/d(rot_y)
-    let j02 = y * invz * fx;                         // d(u_err)/d(rot_z)
-    let j03 = -invz * fx;                            // d(u_err)/d(trans_x)
-    let j04 = 0.0;                                   // d(u_err)/d(trans_y)
-    let j05 = x * invz2 * fx;                        // d(u_err)/d(trans_z)
+    let j00 = x * y * invz2 * fx; // d(u_err)/d(rot_x)
+    let j01 = -(1.0 + x * x * invz2) * fx; // d(u_err)/d(rot_y)
+    let j02 = y * invz * fx; // d(u_err)/d(rot_z)
+    let j03 = -invz * fx; // d(u_err)/d(trans_x)
+    let j04 = 0.0; // d(u_err)/d(trans_y)
+    let j05 = x * invz2 * fx; // d(u_err)/d(trans_z)
 
     // Row 1 (v/y error derivative)
-    let j10 = (1.0 + y * y * invz2) * fy;            // d(v_err)/d(rot_x)
-    let j11 = -x * y * invz2 * fy;                   // d(v_err)/d(rot_y)
-    let j12 = -x * invz * fy;                        // d(v_err)/d(rot_z)
-    let j13 = 0.0;                                   // d(v_err)/d(trans_x)
-    let j14 = -invz * fy;                            // d(v_err)/d(trans_y)
-    let j15 = y * invz2 * fy;                        // d(v_err)/d(trans_z)
+    let j10 = (1.0 + y * y * invz2) * fy; // d(v_err)/d(rot_x)
+    let j11 = -x * y * invz2 * fy; // d(v_err)/d(rot_y)
+    let j12 = -x * invz * fy; // d(v_err)/d(rot_z)
+    let j13 = 0.0; // d(v_err)/d(trans_x)
+    let j14 = -invz * fy; // d(v_err)/d(trans_y)
+    let j15 = y * invz2 * fy; // d(v_err)/d(trans_z)
 
     // Matrix2x6 in row-major: (row0_col0, row0_col1, ..., row1_col0, ...)
     let j_pose = Matrix2x6::new(j00, j01, j02, j03, j04, j05, j10, j11, j12, j13, j14, j15);
