@@ -1,6 +1,6 @@
 use anyhow::Result;
 use nalgebra::Vector3;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 use rust_vslam::io::euroc::EurocDataset;
 use rust_vslam::system::SlamSystem;

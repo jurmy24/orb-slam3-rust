@@ -17,7 +17,7 @@ use nalgebra::Vector3;
 use opencv::core::{Mat, Point2f, Vector};
 use opencv::features2d::BFMatcher;
 use opencv::prelude::*;
-use tracing::{error, debug};
+use tracing::{debug, error};
 
 use crate::atlas::keyframe_db::BowVector;
 use crate::atlas::map::{KeyFrameId, MapPointId};

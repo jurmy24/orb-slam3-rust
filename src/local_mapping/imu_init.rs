@@ -76,7 +76,11 @@ pub fn initialize_imu(shared: &Arc<SharedState>) -> Option<ImuInitResult> {
     }
 
     // Get keyframes in temporal order (need to clone IDs since we'll drop the lock)
-    let keyframe_ids: Vec<KeyFrameId> = map.keyframes_temporal_order().iter().map(|kf| kf.id).collect();
+    let keyframe_ids: Vec<KeyFrameId> = map
+        .keyframes_temporal_order()
+        .iter()
+        .map(|kf| kf.id)
+        .collect();
     if keyframe_ids.len() < MIN_KEYFRAMES_FOR_INIT {
         return None;
     }
@@ -85,12 +89,13 @@ pub fn initialize_imu(shared: &Arc<SharedState>) -> Option<ImuInitResult> {
     drop(atlas);
     let atlas = shared.atlas.read();
     let map = atlas.active_map();
-    
+
     // Get keyframes by ID
-    let keyframes: Vec<_> = keyframe_ids.iter()
+    let keyframes: Vec<_> = keyframe_ids
+        .iter()
         .filter_map(|&id| map.get_keyframe(id))
         .collect();
-    
+
     if keyframes.len() < MIN_KEYFRAMES_FOR_INIT {
         return None;
     }

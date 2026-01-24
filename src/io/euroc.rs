@@ -74,10 +74,7 @@ impl EurocDataset {
         // Ground truth is optional - some datasets might not have it
         let groundtruth = load_groundtruth_list(root.join("state_groundtruth_estimate0/data.csv"))
             .unwrap_or_else(|e| {
-                warn!(
-                    "Could not load ground truth: {}. Continuing without it.",
-                    e
-                );
+                warn!("Could not load ground truth: {}. Continuing without it.", e);
                 Vec::new()
             });
         let calib = load_stereo_calibration(&root)?;

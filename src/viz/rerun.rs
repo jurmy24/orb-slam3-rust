@@ -346,7 +346,7 @@ impl RerunVisualizer {
                 "world/groundtruth",
                 &rerun::LineStrips3D::new([pts])
                     .with_colors([[0u8, 200, 100]]) // Green
-                    .with_radii([0.008f32]),        // Slightly thicker than estimated
+                    .with_radii([0.008f32]), // Slightly thicker than estimated
             )
             .ok();
     }
