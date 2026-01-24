@@ -27,9 +27,8 @@ use crate::io::euroc::ImuEntry;
 use crate::system::messages::NewKeyFrameMsg;
 use crate::system::shared_state::SharedState;
 use crate::tracking::TrackingState;
-use crate::tracking::frame::{CameraModel, StereoFrame};
+use crate::tracking::frame::{CameraModel, NN_RATIO, StereoFrame, TH_HIGH, descriptor_distance};
 use crate::tracking::keyframe_decision::KeyFrameDecision;
-use crate::tracking::matching::{NN_RATIO, TH_HIGH, descriptor_distance};
 use crate::tracking::result::{MatchInfo, TimingStats, TrackingMetrics, TrackingResult};
 use crate::tracking::tracking_frame::Frame;
 

@@ -11,7 +11,6 @@ pub mod frame;
 pub mod tracking_frame;
 pub mod keyframe_decision;
 pub mod local_map;
-pub mod matching;
 pub mod motion_model;
 pub mod pose_estimation;
 pub mod state;

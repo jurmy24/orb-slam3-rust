@@ -21,20 +21,24 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "data/euroc/MH_01_easy/mav0".to_string());
 
     let dataset = EurocDataset::new(&dataset_path)?;
-    info!(
+    debug!(
         "Loaded {} stereo frames, {} IMU samples, {} ground truth entries",
         dataset.len(),
         dataset.imu_entries.len(),
         dataset.groundtruth.len()
     );
+    // Print the camera baseline and calibration matrix
+    debug!("Camera baseline: {}", dataset.calibration.baseline);
+    debug!(
+        "Camera calibration matrix: {:?}",
+        dataset.calibration.k_left
+    );
 
-    // Set up camera model
     let cam =
         CameraModel::from_k_and_baseline(dataset.calibration.k_left, dataset.calibration.baseline);
-
     let mut stereo = StereoProcessor::new(cam, 1200)?;
     let mut slam_system = SlamSystem::new(cam)?;
-    let mut viz = RerunVisualizer::new("rust-orb-slam3-stereo-inertial-2");
+    let mut viz = RerunVisualizer::new("rust-orb-slam3-stereo-inertial");
 
     // Iterates over stereo frames (not IMU samples!)
     for i in 0..dataset.len() {
