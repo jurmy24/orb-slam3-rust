@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use nalgebra::{UnitQuaternion, Vector3};
+use tracing::info;
 
 use crate::atlas::map::KeyFrameId;
 use crate::imu::{ImuBias, ImuInitState};
@@ -213,7 +214,7 @@ pub fn apply_imu_init(shared: &Arc<SharedState>, result: &ImuInitResult) {
     // Mark IMU as initialized
     map.set_imu_init_state(ImuInitState::Initialized);
 
-    eprintln!(
+    info!(
         "IMU initialized! Gravity direction estimated from {} keyframes over {:.2}s",
         map.num_keyframes(),
         map.time_span_seconds()

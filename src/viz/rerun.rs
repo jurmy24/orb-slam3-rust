@@ -26,6 +26,7 @@ use opencv::core::Mat;
 use opencv::prelude::*;
 use rerun::{RecordingStream, external::glam};
 use std::collections::HashSet;
+use tracing::warn;
 
 use crate::atlas::map::KeyFrame;
 use crate::geometry::SE3;
@@ -55,7 +56,7 @@ impl RerunVisualizer {
         let blueprint_path = std::path::Path::new(Self::BLUEPRINT_PATH);
         if blueprint_path.exists() {
             if let Err(e) = rec.log_file_from_path(blueprint_path, None, false) {
-                eprintln!("Warning: Failed to load blueprint: {}", e);
+                warn!("Failed to load blueprint: {}", e);
             }
         }
 

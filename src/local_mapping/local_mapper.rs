@@ -14,10 +14,11 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use opencv::core::Mat;
 use opencv::prelude::*;
+use tracing::debug;
 
 use crate::atlas::keyframe_db::BowVector;
 use crate::atlas::map::KeyFrameId;
-use crate::optimizer::{local_bundle_adjustment as run_local_ba, LocalBAConfig};
+use crate::optimizer::{LocalBAConfig, local_bundle_adjustment as run_local_ba};
 use crate::system::messages::NewKeyFrameMsg;
 use crate::system::shared_state::SharedState;
 use crate::tracking::frame::CameraModel;
@@ -226,7 +227,7 @@ impl LocalMapper {
         let map = atlas.active_map_mut();
         if let Some(result) = run_local_ba(map, kf_id, &self.camera, &config, &should_stop) {
             if result.iterations > 0 {
-                eprintln!(
+                debug!(
                     "[LocalBA] kf={} iters={} error: {:.2} -> {:.2} (kfs={}, mps={}, obs={})",
                     kf_id.0,
                     result.iterations,

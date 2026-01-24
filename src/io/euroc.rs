@@ -7,6 +7,7 @@ use nalgebra::{Matrix3, Matrix4, Vector3};
 use opencv::prelude::*;
 use opencv::{imgcodecs, imgcodecs::IMREAD_GRAYSCALE};
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::geometry::SE3;
 use crate::imu::ImuSample;
@@ -73,7 +74,10 @@ impl EurocDataset {
         // Ground truth is optional - some datasets might not have it
         let groundtruth = load_groundtruth_list(root.join("state_groundtruth_estimate0/data.csv"))
             .unwrap_or_else(|e| {
-                eprintln!("Warning: Could not load ground truth: {}. Continuing without it.", e);
+                warn!(
+                    "Could not load ground truth: {}. Continuing without it.",
+                    e
+                );
                 Vec::new()
             });
         let calib = load_stereo_calibration(&root)?;
@@ -142,7 +146,7 @@ impl EurocDataset {
     /// Get all ground truth positions up to (and including) the given timestamp.
     /// Transforms from body/IMU frame to camera frame (cam0) and aligns to SLAM origin.
     /// Uses binary search for O(log n) lookup instead of O(n) scan.
-    /// 
+    ///
     /// Note: GT pose is body pose in reference/world frame. We transform the full pose
     /// from body to camera: T_world_cam = T_world_body * T_body_cam = T_world_body * T_cam0_body^-1
     /// Then we subtract the first GT position so trajectories are origin-aligned.
@@ -150,18 +154,19 @@ impl EurocDataset {
         if self.groundtruth.is_empty() {
             return Vec::new();
         }
-        
+
         // Transform from body frame to camera frame: T_cam0_body
         // GT pose is T_world_body, we need T_world_cam = T_world_body * T_body_cam0
         let t_body_cam0 = self.calibration.t_cam0_body.inverse();
-        
+
         // Get the first GT position (to align with SLAM origin)
         let first_gt_cam = self.groundtruth[0].pose.compose(&t_body_cam0).translation;
-        
+
         // Use binary search to find the cutoff point efficiently
-        let cutoff_idx = self.groundtruth
+        let cutoff_idx = self
+            .groundtruth
             .partition_point(|gt| gt.timestamp_ns <= timestamp_ns);
-        
+
         self.groundtruth[..cutoff_idx]
             .iter()
             .map(|gt| {
@@ -331,7 +336,6 @@ fn load_stereo_calibration(root: &Path) -> Result<StereoCalibration> {
     let t_cam1_body = transform_from(&cam1.t_bs.data)?;
 
     // Transform from cam0 to cam1: T_c1_c0 = T_c1_b * T_b_c0
-    // TODO: Double check this is correct, especially the baseline calculation
     let t_cam0_body_inv = t_cam0_body.inverse();
     let t_cam1_cam0 = t_cam1_body.compose(&t_cam0_body_inv);
     let baseline = t_cam1_cam0.translation.norm();

@@ -17,6 +17,7 @@ use nalgebra::Vector3;
 use opencv::core::{Mat, Point2f, Vector};
 use opencv::features2d::BFMatcher;
 use opencv::prelude::*;
+use tracing::{error, debug};
 
 use crate::atlas::keyframe_db::BowVector;
 use crate::atlas::map::{KeyFrameId, MapPointId};
@@ -447,7 +448,7 @@ impl Tracker {
 
         if num_keyframes < MIN_KEYFRAMES_FOR_NEW_MAP {
             // Too few keyframes - reset current map
-            eprintln!(
+            error!(
                 "Tracking LOST with {} keyframes - resetting active map",
                 num_keyframes
             );
@@ -455,7 +456,7 @@ impl Tracker {
             atlas.reset_active_map();
         } else {
             // Enough keyframes - create new map (old map preserved for potential merging)
-            eprintln!("Tracking LOST - creating new map in Atlas");
+            error!("Tracking LOST - creating new map in Atlas");
             let mut atlas = self.shared.atlas.write();
             atlas.create_new_map();
         }
@@ -793,7 +794,7 @@ impl Tracker {
         let n_corr = pts3d.len();
 
         if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-            eprintln!(
+            debug!(
                 "[track_local_map] frame={} local_kfs={} local_mps={} correspondences={}",
                 self.frame_count,
                 local_kfs.len(),
@@ -843,7 +844,7 @@ impl Tracker {
         let n_inliers = pnp.inlier_mask.iter().filter(|&&b| b).count();
 
         if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-            eprintln!("[track_local_map] pnp_inliers={}", n_inliers);
+            debug!("[track_local_map] pnp_inliers={}", n_inliers);
         }
 
         Ok((
@@ -907,7 +908,7 @@ impl Tracker {
         }
 
         if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-            eprintln!(
+            debug!(
                 "[track_ref_kf] frame={} total_matches={} matches_with_mp={} pts3d={}",
                 self.frame_count,
                 total_matches,
@@ -924,7 +925,7 @@ impl Tracker {
         if let Ok(ref res) = result {
             let n_inliers = res.inlier_mask.iter().filter(|&&b| b).count();
             if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-                eprintln!("[track_ref_kf] pnp_inliers={}", n_inliers);
+                debug!("[track_ref_kf] pnp_inliers={}", n_inliers);
             }
         }
 
@@ -1033,7 +1034,7 @@ impl Tracker {
         }
 
         if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-            eprintln!(
+            debug!(
                 "[track_motion] frame={} prev_mps={} correspondences={}",
                 self.frame_count,
                 self.last_frame_map_points
@@ -1055,7 +1056,7 @@ impl Tracker {
         if let Ok(ref res) = result {
             let n_inliers = res.inlier_mask.iter().filter(|&&b| b).count();
             if self.frame_count <= 5 || self.frame_count % 100 == 0 {
-                eprintln!("[track_motion] pnp_inliers={}", n_inliers);
+                debug!("[track_motion] pnp_inliers={}", n_inliers);
             }
             // Only accept if we have enough inliers
             if n_inliers < 10 {

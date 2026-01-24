@@ -1,5 +1,6 @@
 use anyhow::Result;
 use nalgebra::Vector3;
+use tracing::{info, debug, warn};
 
 use rust_vslam::io::euroc::EurocDataset;
 use rust_vslam::system::SlamSystem;
@@ -8,66 +9,24 @@ use rust_vslam::tracking::result::TrackingResult;
 use rust_vslam::viz::rerun::RerunVisualizer;
 
 fn main() -> Result<()> {
+    // Initialize tracing subscriber with environment filter
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .init();
     let dataset_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "data/euroc/MH_01_easy/mav0".to_string());
 
-    println!("Loading EuRoC dataset from: {}", dataset_path);
     let dataset = EurocDataset::new(&dataset_path)?;
-    println!(
+    info!(
         "Loaded {} stereo frames, {} IMU samples, {} ground truth entries",
         dataset.len(),
         dataset.imu_entries.len(),
         dataset.groundtruth.len()
     );
-    
-    // Debug: Print first few ground truth entries
-    if !dataset.groundtruth.is_empty() {
-        let first_gt = &dataset.groundtruth[0];
-        let last_gt = &dataset.groundtruth[dataset.groundtruth.len() - 1];
-        println!(
-            "Ground truth range: {} ns to {} ns (first pos: [{:.2}, {:.2}, {:.2}], last pos: [{:.2}, {:.2}, {:.2}])",
-            first_gt.timestamp_ns,
-            last_gt.timestamp_ns,
-            first_gt.pose.translation.x,
-            first_gt.pose.translation.y,
-            first_gt.pose.translation.z,
-            last_gt.pose.translation.x,
-            last_gt.pose.translation.y,
-            last_gt.pose.translation.z,
-        );
-        
-        // Check camera frame timestamps
-        if !dataset.cam0_entries.is_empty() {
-            let first_cam = &dataset.cam0_entries[0];
-            let last_cam = &dataset.cam0_entries[dataset.cam0_entries.len() - 1];
-            println!(
-                "Camera frame range: {} ns to {} ns",
-                first_cam.timestamp_ns,
-                last_cam.timestamp_ns
-            );
-            
-            // Check if timestamps overlap
-            if first_cam.timestamp_ns < first_gt.timestamp_ns {
-                println!(
-                    "WARNING: First camera frame ({}) is BEFORE first GT entry ({}) - offset: {} ns ({:.3} s)",
-                    first_cam.timestamp_ns,
-                    first_gt.timestamp_ns,
-                    first_gt.timestamp_ns.saturating_sub(first_cam.timestamp_ns),
-                    (first_gt.timestamp_ns.saturating_sub(first_cam.timestamp_ns)) as f64 / 1e9
-                );
-            }
-            if last_cam.timestamp_ns > last_gt.timestamp_ns {
-                println!(
-                    "WARNING: Last camera frame ({}) is AFTER last GT entry ({}) - offset: {} ns ({:.3} s)",
-                    last_cam.timestamp_ns,
-                    last_gt.timestamp_ns,
-                    last_cam.timestamp_ns.saturating_sub(last_gt.timestamp_ns),
-                    (last_cam.timestamp_ns.saturating_sub(last_gt.timestamp_ns)) as f64 / 1e9
-                );
-            }
-        }
-    }
 
     // Set up camera model
     let cam =
@@ -75,7 +34,7 @@ fn main() -> Result<()> {
 
     let mut stereo = StereoProcessor::new(cam, 1200)?;
     let mut slam_system = SlamSystem::new(cam)?;
-    let mut viz = RerunVisualizer::new("rust-orb-slam3-stereo-inertial");
+    let mut viz = RerunVisualizer::new("rust-orb-slam3-stereo-inertial-2");
 
     // Iterates over stereo frames (not IMU samples!)
     for i in 0..dataset.len() {
@@ -126,15 +85,15 @@ fn main() -> Result<()> {
             .map(|p| p.translation)
             .collect();
         viz.log_trajectory(&est_trajectory);
-        
+
         // Ground truth trajectory (up to current frame time)
         // Note: We transform GT from body frame to camera frame to match SLAM coordinate system
         let gt_positions = dataset.groundtruth_positions_until(pair.timestamp_ns);
         viz.log_groundtruth_trajectory(&gt_positions);
-        
+
         // Debug output periodically
         if i % 100 == 0 {
-            println!(
+            debug!(
                 "Frame {} (ts={}): Est trajectory: {} points, GT trajectory: {} points",
                 i,
                 pair.timestamp_ns,
@@ -144,28 +103,37 @@ fn main() -> Result<()> {
             if !est_trajectory.is_empty() {
                 let first_est = est_trajectory.first().unwrap();
                 let last_est = est_trajectory.last().unwrap();
-                println!(
+                debug!(
                     "  Est: first=[{:.2}, {:.2}, {:.2}], last=[{:.2}, {:.2}, {:.2}], dist={:.2}m",
-                    first_est.x, first_est.y, first_est.z,
-                    last_est.x, last_est.y, last_est.z,
+                    first_est.x,
+                    first_est.y,
+                    first_est.z,
+                    last_est.x,
+                    last_est.y,
+                    last_est.z,
                     (last_est - first_est).norm()
                 );
             }
             if !gt_positions.is_empty() {
                 let first_gt = gt_positions.first().unwrap();
                 let last_gt = gt_positions.last().unwrap();
-                println!(
+                debug!(
                     "  GT: first=[{:.2}, {:.2}, {:.2}], last=[{:.2}, {:.2}, {:.2}], dist={:.2}m",
-                    first_gt.x, first_gt.y, first_gt.z,
-                    last_gt.x, last_gt.y, last_gt.z,
+                    first_gt.x,
+                    first_gt.y,
+                    first_gt.z,
+                    last_gt.x,
+                    last_gt.y,
+                    last_gt.z,
                     (last_gt - first_gt).norm()
                 );
             } else {
                 // Check why GT is empty
                 if !dataset.groundtruth.is_empty() {
                     let first_gt_ts = dataset.groundtruth[0].timestamp_ns;
-                    let last_gt_ts = dataset.groundtruth[dataset.groundtruth.len() - 1].timestamp_ns;
-                    println!(
+                    let last_gt_ts =
+                        dataset.groundtruth[dataset.groundtruth.len() - 1].timestamp_ns;
+                    warn!(
                         "  GT empty! Frame ts={}, GT range=[{}, {}]",
                         pair.timestamp_ns, first_gt_ts, last_gt_ts
                     );
@@ -215,7 +183,7 @@ fn main() -> Result<()> {
 
             // Log map statistics periodically
             if i % 100 == 0 {
-                println!(
+                info!(
                     "Frame {}/{}: {} keyframes, {} map points, state={:?}, IMU={:?}",
                     i,
                     dataset.len(),
@@ -228,7 +196,7 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("Done! Processed {} frames", dataset.len());
+    info!("Done! Processed {} frames", dataset.len());
 
     // Shutdown cleanly (joins Local Mapping thread)
     slam_system.shutdown();
