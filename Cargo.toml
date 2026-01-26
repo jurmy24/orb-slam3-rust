@@ -17,6 +17,7 @@ crossbeam-channel = "0.5"
 parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+levenberg-marquardt = "0.15.0"
 
 [dev-dependencies]
 approx = "0.5"

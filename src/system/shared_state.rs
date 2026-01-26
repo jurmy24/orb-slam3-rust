@@ -9,12 +9,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::RwLock;
 
 use crate::atlas::atlas::Atlas;
+use crate::vocabulary::OrbVocabulary;
 
 /// Shared state accessible by both Tracking and Local Mapping threads.
 pub struct SharedState {
     /// The Atlas containing all maps, keyframes, and map points.
     /// Protected by RwLock: Tracking reads, Local Mapping writes.
     pub atlas: RwLock<Atlas>,
+
+    /// ORB vocabulary for Bag-of-Words computation.
+    /// None if vocabulary hasn't been loaded.
+    pub vocabulary: Option<Arc<OrbVocabulary>>,
 
     /// Flow control: when true, Tracking should not create new keyframes.
     /// Set by Local Mapping when the keyframe queue is too long.
@@ -29,14 +34,31 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// Create a new SharedState with an empty Atlas.
+    /// Create a new SharedState with an empty Atlas and no vocabulary.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             atlas: RwLock::new(Atlas::new()),
+            vocabulary: None,
             stop_keyframe_creation: AtomicBool::new(false),
             abort_ba: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
         })
+    }
+
+    /// Create a new SharedState with a vocabulary.
+    pub fn with_vocabulary(vocabulary: OrbVocabulary) -> Arc<Self> {
+        Arc::new(Self {
+            atlas: RwLock::new(Atlas::new()),
+            vocabulary: Some(Arc::new(vocabulary)),
+            stop_keyframe_creation: AtomicBool::new(false),
+            abort_ba: AtomicBool::new(false),
+            shutdown_requested: AtomicBool::new(false),
+        })
+    }
+
+    /// Get a reference to the vocabulary, if loaded.
+    pub fn vocabulary(&self) -> Option<&Arc<OrbVocabulary>> {
+        self.vocabulary.as_ref()
     }
 
     /// Check if keyframe creation should be stopped (flow control).
@@ -79,6 +101,7 @@ impl Default for SharedState {
     fn default() -> Self {
         Self {
             atlas: RwLock::new(Atlas::new()),
+            vocabulary: None,
             stop_keyframe_creation: AtomicBool::new(false),
             abort_ba: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),

@@ -58,6 +58,13 @@ pub struct KeyFrame {
     /// KeyFrame simply stores the resulting sparse histogram.
     pub bow_vector: Option<crate::atlas::keyframe_db::BowVector>,
 
+    /// Optional Feature Vector for accelerated feature matching.
+    ///
+    /// Groups feature indices by vocabulary node at level L-4 (typically ~10 groups).
+    /// This enables O(N·k) matching instead of O(N²) by only comparing features
+    /// that share the same vocabulary node.
+    pub feature_vector: Option<crate::vocabulary::FeatureVector>,
+
     // ─────────────────────────────────────────────────────────────────────────
     // Map Associations
     // ─────────────────────────────────────────────────────────────────────────
@@ -153,6 +160,7 @@ impl KeyFrame {
             prev_kf: None,
             next_kf: None,
             bow_vector: None,
+            feature_vector: None,
             covisibility_weights: HashMap::new(),
             ordered_covisibles: Vec::new(),
             covisibility_dirty: false,
@@ -192,6 +200,19 @@ impl KeyFrame {
     /// Get a reference to the Bag-of-Words vector, if available.
     pub fn bow_vector(&self) -> Option<&crate::atlas::keyframe_db::BowVector> {
         self.bow_vector.as_ref()
+    }
+
+    /// Set the Feature Vector for this keyframe.
+    ///
+    /// The Feature Vector groups feature indices by vocabulary node,
+    /// enabling accelerated feature matching during triangulation.
+    pub fn set_feature_vector(&mut self, fv: crate::vocabulary::FeatureVector) {
+        self.feature_vector = Some(fv);
+    }
+
+    /// Get a reference to the Feature Vector, if available.
+    pub fn feature_vector(&self) -> Option<&crate::vocabulary::FeatureVector> {
+        self.feature_vector.as_ref()
     }
 
     // ─────────────────────────────────────────────────────────────────────────

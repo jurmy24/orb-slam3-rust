@@ -24,6 +24,7 @@ use crate::atlas::map::{KeyFrameId, MapPointId};
 use crate::geometry::{SE3, solve_pnp_ransac_detailed};
 use crate::imu::{ImuBias, ImuNoise, Preintegrator};
 use crate::io::euroc::ImuEntry;
+use crate::optimizer::{pose_inertial_optimization, PoseInertialConfig, PoseObservation};
 use crate::system::messages::NewKeyFrameMsg;
 use crate::system::shared_state::SharedState;
 use crate::tracking::TrackingState;
@@ -385,6 +386,7 @@ impl Tracker {
     /// 1. Try TrackWithMotionModel (constant velocity assumption)
     /// 2. If that fails, try TrackReferenceKeyFrame
     /// 3. Refine with TrackLocalMap
+    /// 4. If IMU initialized, refine with PoseInertialOptimization
     fn track_normal(
         &mut self,
         frame: &Frame,
@@ -429,13 +431,112 @@ impl Tracker {
         };
         self.pose = estimated_pose;
 
+        // Stage 3: Refine with IMU constraints (if IMU is initialized)
+        let (final_inliers, final_matches, final_reproj_errors, final_inlier_indices, final_outlier_indices) = {
+            let atlas = self.shared.atlas.read();
+            let map = atlas.active_map();
+
+            if map.is_imu_initialized() && self.reference_kf.is_some() {
+                // Try pose inertial optimization
+                if let Some((refined_pose, refined_velocity, refined_bias, refined_inliers)) =
+                    self.refine_with_imu(frame, &matches, map)
+                {
+                    self.pose = refined_pose;
+                    self.velocity = refined_velocity;
+                    self.preintegrator.bias = refined_bias;
+
+                    // Use refined inlier count, but keep same matches structure
+                    (refined_inliers, matches, reproj_errors, inlier_indices, outlier_indices)
+                } else {
+                    (inliers, matches, reproj_errors, inlier_indices, outlier_indices)
+                }
+            } else {
+                (inliers, matches, reproj_errors, inlier_indices, outlier_indices)
+            }
+        };
+
         Ok((
-            inliers,
-            matches,
-            reproj_errors,
-            inlier_indices,
-            outlier_indices,
+            final_inliers,
+            final_matches,
+            final_reproj_errors,
+            final_inlier_indices,
+            final_outlier_indices,
         ))
+    }
+
+    /// Refine pose with IMU constraints using pose_inertial_optimization.
+    ///
+    /// Called after track_local_map when IMU is initialized.
+    fn refine_with_imu(
+        &self,
+        frame: &Frame,
+        matched_map_points: &[Option<MapPointId>],
+        map: &crate::atlas::map::Map,
+    ) -> Option<(SE3, Vector3<f64>, ImuBias, usize)> {
+        // Get reference keyframe (previous keyframe for IMU preintegration)
+        let ref_kf_id = self.reference_kf?;
+        let ref_kf = map.get_keyframe(ref_kf_id)?;
+
+        // Build visual observations
+        let mut observations = Vec::new();
+        for (feat_idx, mp_id_opt) in matched_map_points.iter().enumerate() {
+            let mp_id = match mp_id_opt {
+                Some(id) => *id,
+                None => continue,
+            };
+
+            let mp = match map.get_map_point(mp_id) {
+                Some(mp) => mp,
+                None => continue,
+            };
+
+            let kp = match frame.keypoints().get(feat_idx) {
+                Ok(kp) => kp,
+                Err(_) => continue,
+            };
+
+            // Check if this is a stereo observation (has depth)
+            let is_stereo = frame.points_cam.get(feat_idx).map_or(false, |p| p.is_some());
+
+            observations.push(PoseObservation {
+                uv: nalgebra::Vector2::new(kp.pt().x as f64, kp.pt().y as f64),
+                point_world: mp.position,
+                is_stereo,
+                index: feat_idx,
+            });
+        }
+
+        // Need enough observations
+        if observations.len() < 10 {
+            return None;
+        }
+
+        // Get preintegrated state since last keyframe
+        let preintegrated = &self.kf_preintegrator.state;
+
+        // Run pose inertial optimization
+        let config = PoseInertialConfig::default();
+        let result = pose_inertial_optimization(
+            &self.pose,
+            &self.velocity,
+            &self.preintegrator.bias,
+            &ref_kf.pose,
+            &ref_kf.velocity,
+            &ref_kf.imu_bias,
+            preintegrated,
+            &observations,
+            &self.camera,
+            &config,
+        );
+
+        if self.frame_count <= 5 || self.frame_count % 100 == 0 {
+            debug!(
+                "[pose_inertial_opt] frame={} iters={} inliers={}/{}",
+                self.frame_count, result.iterations, result.num_inliers, result.num_observations
+            );
+        }
+
+        Some((result.pose, result.velocity, result.bias, result.num_inliers))
     }
 
     /// Handle LOST state: create new map or reset current map.
@@ -650,10 +751,14 @@ impl Tracker {
         self.reference_kf = Some(kf_id);
         self.reference_kf_num_points = num_points;
 
-        // Compute BoW and add to database
+        // Compute BoW using vocabulary and add to database
+        let vocabulary = self.shared.vocabulary();
         if let Some(kf) = map.get_keyframe_mut(kf_id) {
-            let bow = compute_bow_stub(&kf.descriptors);
+            let (bow, feat_vec) = compute_bow_vector(&kf.descriptors, vocabulary);
             kf.set_bow_vector(bow.clone());
+            if let Some(fv) = feat_vec {
+                kf.set_feature_vector(fv);
+            }
             let map_idx = atlas.active_map_index();
             atlas.keyframe_db.add(kf_id, bow, map_idx);
         }
@@ -737,17 +842,9 @@ impl Tracker {
             let u = self.camera.fx * p_cam.x / p_cam.z + self.camera.cx;
             let v = self.camera.fy * p_cam.y / p_cam.z + self.camera.cy;
 
-            // Find candidates within search radius
+            // Find candidates within search radius using spatial grid (O(k) instead of O(N))
             const SEARCH_RADIUS: f64 = 15.0;
-            let mut candidates: Vec<usize> = Vec::new();
-            for (kp_idx, kp) in frame.keypoints().iter().enumerate() {
-                let du = kp.pt().x as f64 - u;
-                let dv = kp.pt().y as f64 - v;
-                let spatial_dist_sq = du * du + dv * dv;
-                if spatial_dist_sq < SEARCH_RADIUS * SEARCH_RADIUS {
-                    candidates.push(kp_idx);
-                }
-            }
+            let candidates = frame.grid.get_features_in_area(u, v, SEARCH_RADIUS);
 
             if candidates.is_empty() {
                 continue;
@@ -990,19 +1087,12 @@ impl Tracker {
                 continue;
             }
 
-            // Find candidate features within search radius
+            // Find candidate features within search radius using spatial grid (O(k) instead of O(N))
             let mut best_dist = u32::MAX;
             let mut best_idx: Option<usize> = None;
 
-            for (kp_idx, kp) in frame.keypoints().iter().enumerate() {
-                let du = kp.pt().x as f64 - u;
-                let dv = kp.pt().y as f64 - v;
-                let dist_sq = du * du + dv * dv;
-
-                if dist_sq > search_radius * search_radius {
-                    continue;
-                }
-
+            let candidates = frame.grid.get_features_in_area(u, v, search_radius);
+            for kp_idx in candidates {
                 // Compare descriptors
                 let frame_desc_row = match frame.features.descriptors.row(kp_idx as i32) {
                     Ok(row) => row,
@@ -1094,12 +1184,24 @@ impl Tracker {
     }
 }
 
-/// Simple placeholder Bag-of-Words computation.
-fn compute_bow_stub(descriptors: &Mat) -> BowVector {
-    let mut bow = BowVector::new();
-    let rows = descriptors.rows();
-    for i in 0..rows {
-        bow.insert(i as u32, 1.0);
+/// Compute Bag-of-Words vector using the vocabulary if available,
+/// otherwise fall back to a simple stub.
+fn compute_bow_vector(
+    descriptors: &Mat,
+    vocabulary: Option<&std::sync::Arc<crate::vocabulary::OrbVocabulary>>,
+) -> (BowVector, Option<crate::vocabulary::FeatureVector>) {
+    if let Some(vocab) = vocabulary {
+        // Use real vocabulary transform - this is the correct approach
+        // levels_up = 4 groups features at level L-4 for faster matching
+        let (bow, feat_vec) = vocab.transform(descriptors, 4);
+        (bow, Some(feat_vec))
+    } else {
+        // Fallback stub when vocabulary not loaded
+        let mut bow = BowVector::new();
+        let rows = descriptors.rows();
+        for i in 0..rows {
+            bow.insert(i as u32, 1.0);
+        }
+        (bow, None)
     }
-    bow
 }

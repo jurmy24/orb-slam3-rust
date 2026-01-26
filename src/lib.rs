@@ -6,4 +6,5 @@ pub mod local_mapping;
 pub mod optimizer;
 pub mod system;
 pub mod tracking;
+pub mod vocabulary;
 pub mod viz;

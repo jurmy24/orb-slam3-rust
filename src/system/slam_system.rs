@@ -3,6 +3,7 @@
 //! The `SlamSystem` is the top-level struct that users interact with.
 //! It owns the shared state and spawns the Tracking and Local Mapping threads.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -14,6 +15,7 @@ use crate::local_mapping::LocalMapper;
 use crate::tracking::Tracker;
 use crate::tracking::frame::{CameraModel, StereoFrame};
 use crate::tracking::result::TrackingResult;
+use crate::vocabulary::OrbVocabulary;
 
 use super::messages::NewKeyFrameMsg;
 use super::shared_state::SharedState;
@@ -41,9 +43,34 @@ impl SlamSystem {
     /// Create a new SLAM system with the given camera model.
     ///
     /// This creates the shared state and spawns the Local Mapping thread.
+    /// Use `with_vocabulary` to also load an ORB vocabulary for place recognition.
     pub fn new(camera: CameraModel) -> Result<Self> {
-        let shared = SharedState::new();
+        Self::with_shared_state(camera, SharedState::new())
+    }
 
+    /// Create a new SLAM system with a vocabulary loaded from a file.
+    ///
+    /// The vocabulary is used for Bag-of-Words computation to accelerate
+    /// feature matching and enable place recognition.
+    ///
+    /// # Arguments
+    ///
+    /// * `camera` - Camera model with intrinsics and baseline
+    /// * `vocabulary_path` - Path to ORBvoc.txt (DBoW2 format)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let system = SlamSystem::with_vocabulary(camera, "data/ORBvoc.txt")?;
+    /// ```
+    pub fn with_vocabulary<P: AsRef<Path>>(camera: CameraModel, vocabulary_path: P) -> Result<Self> {
+        let vocabulary = OrbVocabulary::load_from_text(vocabulary_path)?;
+        let shared = SharedState::with_vocabulary(vocabulary);
+        Self::with_shared_state(camera, shared)
+    }
+
+    /// Create a SLAM system with a pre-created shared state.
+    fn with_shared_state(camera: CameraModel, shared: Arc<SharedState>) -> Result<Self> {
         // Create bounded channel for keyframe communication
         let (kf_sender, kf_receiver) = bounded::<NewKeyFrameMsg>(KEYFRAME_CHANNEL_CAPACITY);
 
