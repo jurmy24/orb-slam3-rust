@@ -17,6 +17,10 @@ use tracing::info;
 
 use crate::atlas::map::KeyFrameId;
 use crate::imu::{ImuBias, ImuInitState};
+use crate::optimizer::{
+    apply_inertial_init_result, optimize_inertial_init_full, InertialInitConfig,
+    InertialInitProblem,
+};
 use crate::system::shared_state::SharedState;
 
 /// Minimum number of keyframes required for IMU initialization.
@@ -24,6 +28,14 @@ const MIN_KEYFRAMES_FOR_INIT: usize = 10;
 
 /// Minimum time span (seconds) for stereo-inertial initialization.
 const MIN_TIME_SPAN_STEREO: f64 = 1.0;
+
+/// Time threshold for checking sufficient motion (seconds).
+/// After this time, if camera hasn't moved enough, declare bad_imu.
+const TIME_THRESHOLD_FOR_MOTION_CHECK: f64 = 10.0;
+
+/// Minimum motion threshold for IMU initialization (meters).
+/// If camera moves less than this over TIME_THRESHOLD_FOR_MOTION_CHECK, it's bad.
+const MIN_MOTION_THRESHOLD: f64 = 0.02; // 2cm
 
 /// Result of IMU initialization.
 #[derive(Debug, Clone)]
@@ -167,6 +179,59 @@ pub fn initialize_imu(shared: &Arc<SharedState>) -> Option<ImuInitResult> {
     })
 }
 
+/// Check if there is sufficient motion for IMU initialization.
+///
+/// Returns true if sufficient motion is detected, false if the camera is stationary.
+/// When insufficient motion is detected after TIME_THRESHOLD_FOR_MOTION_CHECK seconds,
+/// the bad_imu flag is set on SharedState.
+///
+/// # Arguments
+/// * `shared` - Shared state containing the atlas
+///
+/// # Returns
+/// * `true` if sufficient motion detected or still waiting
+/// * `false` if insufficient motion detected and bad_imu flag set
+pub fn check_sufficient_motion(shared: &Arc<SharedState>) -> bool {
+    let atlas = shared.atlas.read();
+    let map = atlas.active_map();
+
+    // Check if IMU already initialized
+    if map.is_imu_initialized() {
+        return true;
+    }
+
+    // Get keyframes in temporal order
+    let keyframes = map.keyframes_temporal_order();
+    if keyframes.len() < 2 {
+        return true; // Not enough data yet
+    }
+
+    // Check time span
+    let time_span = map.time_span_seconds();
+    if time_span < TIME_THRESHOLD_FOR_MOTION_CHECK {
+        return true; // Haven't waited long enough yet
+    }
+
+    // Compute total motion from first to last keyframe
+    let first_kf = keyframes.first().unwrap();
+    let last_kf = keyframes.last().unwrap();
+
+    let motion = (last_kf.pose.translation - first_kf.pose.translation).norm();
+
+    if motion < MIN_MOTION_THRESHOLD {
+        // Insufficient motion detected
+        info!(
+            "Insufficient motion for IMU initialization: {:.4}m over {:.1}s (threshold: {:.2}m)",
+            motion, time_span, MIN_MOTION_THRESHOLD
+        );
+        drop(atlas); // Release read lock before setting flag
+        shared.set_bad_imu(true);
+        return false;
+    }
+
+    true
+}
+
 /// Compute rotation that transforms vector `from` to vector `to`.
 fn rotation_between_vectors(from: &Vector3<f64>, to: &Vector3<f64>) -> UnitQuaternion<f64> {
     let from_normalized = from.normalize();
@@ -204,26 +269,62 @@ fn rotation_between_vectors(from: &Vector3<f64>, to: &Vector3<f64>) -> UnitQuate
 ///
 /// This updates:
 /// - Keyframe velocities
+/// - Runs the inertial initialization optimizer
 /// - Sets the IMU initialized flag
 pub fn apply_imu_init(shared: &Arc<SharedState>, result: &ImuInitResult) {
-    let mut atlas = shared.atlas.write();
-    let map = atlas.active_map_mut();
+    // First pass: apply initial velocities
+    {
+        let mut atlas = shared.atlas.write();
+        let map = atlas.active_map_mut();
 
-    // Update velocities for each keyframe
-    for (kf_id, vel) in &result.velocities {
-        if let Some(kf) = map.get_keyframe_mut(*kf_id) {
-            kf.velocity = *vel;
+        // Update velocities for each keyframe
+        for (kf_id, vel) in &result.velocities {
+            if let Some(kf) = map.get_keyframe_mut(*kf_id) {
+                kf.velocity = *vel;
+            }
         }
     }
 
-    // Mark IMU as initialized
-    map.set_imu_init_state(ImuInitState::Initialized);
+    // Second pass: run optimization
+    let optim_result = {
+        let atlas = shared.atlas.read();
+        let map = atlas.active_map();
+        let time_span = map.time_span_seconds();
 
-    info!(
-        "IMU initialized! Gravity direction estimated from {} keyframes over {:.2}s",
-        map.num_keyframes(),
-        map.time_span_seconds()
-    );
+        // Build optimization problem
+        if let Some(problem) = InertialInitProblem::from_map(map, result.rwg) {
+            let config = InertialInitConfig::for_time(time_span);
+            Some(optimize_inertial_init_full(&problem, &config))
+        } else {
+            None
+        }
+    };
+
+    // Third pass: apply optimization results and mark as initialized
+    {
+        let mut atlas = shared.atlas.write();
+        let map = atlas.active_map_mut();
+
+        if let Some(ref optim) = optim_result {
+            apply_inertial_init_result(map, optim);
+        }
+
+        // Mark IMU as initialized
+        map.set_imu_init_state(ImuInitState::Initialized);
+
+        info!(
+            "IMU initialized! Gravity direction estimated from {} keyframes over {:.2}s",
+            map.num_keyframes(),
+            map.time_span_seconds()
+        );
+
+        if let Some(ref optim) = optim_result {
+            info!(
+                "Inertial optimization: {} iters, cost {:.4} -> {:.4}, converged={}",
+                optim.iterations, optim.initial_cost, optim.final_cost, optim.converged
+            );
+        }
+    }
 }
 
 #[cfg(test)]

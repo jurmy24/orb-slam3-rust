@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use nalgebra::Vector3;
 use opencv::core::{KeyPoint, Mat, Vector};
+use opencv::prelude::MatTraitConst;
 
 use crate::geometry::SE3;
 use crate::imu::ImuInitState;
@@ -746,6 +747,200 @@ impl Map {
         self.map_points.clear();
         self.next_kf_id = 0;
         self.next_mp_id = 0;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Map Point Fusion
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Merge two map points, transferring observations from goner to keeper.
+    ///
+    /// This function:
+    /// 1. Transfers observations from goner to keeper
+    /// 2. Updates covisibility graph
+    /// 3. Updates keeper's found/visible counts
+    /// 4. Marks goner as bad and removes it
+    ///
+    /// # Arguments
+    /// * `keeper_id` - ID of the map point to keep
+    /// * `goner_id` - ID of the map point to merge into keeper and remove
+    ///
+    /// # Returns
+    /// `true` if merge was successful, `false` if either point doesn't exist
+    pub fn merge_map_points(&mut self, keeper_id: MapPointId, goner_id: MapPointId) -> bool {
+        if keeper_id == goner_id {
+            return false;
+        }
+
+        // Get goner's observations and statistics
+        let goner_data: Option<(Vec<(KeyFrameId, usize)>, u32, u32)> =
+            self.map_points.get(&goner_id).map(|mp| {
+                (
+                    mp.observations.iter().map(|(&k, &v)| (k, v)).collect(),
+                    mp.visible_count,
+                    mp.found_count,
+                )
+            });
+
+        let (goner_obs, goner_visible, goner_found) = match goner_data {
+            Some(data) => data,
+            None => return false,
+        };
+
+        // Check keeper exists
+        if !self.map_points.contains_key(&keeper_id) {
+            return false;
+        }
+
+        // Transfer observations from goner to keeper
+        for (kf_id, feat_idx) in goner_obs {
+            // Check if keeper already has an observation in this keyframe
+            let keeper_has_obs = self
+                .map_points
+                .get(&keeper_id)
+                .map(|mp| mp.observations.contains_key(&kf_id))
+                .unwrap_or(false);
+
+            if keeper_has_obs {
+                // Keeper already observed by this KF - just remove goner's observation
+                if let Some(kf) = self.keyframes.get_mut(&kf_id) {
+                    kf.erase_map_point(feat_idx);
+                }
+            } else {
+                // Transfer observation to keeper
+                // Update keyframe to point to keeper
+                if let Some(kf) = self.keyframes.get_mut(&kf_id) {
+                    kf.set_map_point(feat_idx, keeper_id);
+                }
+
+                // Add observation to keeper
+                if let Some(keeper) = self.map_points.get_mut(&keeper_id) {
+                    keeper.add_observation(kf_id, feat_idx);
+                }
+
+                // Update covisibility with other keyframes observing keeper
+                let other_observers: Vec<KeyFrameId> = self
+                    .map_points
+                    .get(&keeper_id)
+                    .map(|mp| {
+                        mp.observations
+                            .keys()
+                            .filter(|&&id| id != kf_id)
+                            .copied()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                for other_kf_id in other_observers {
+                    // Increment covisibility weight
+                    let current_weight = self
+                        .keyframes
+                        .get(&other_kf_id)
+                        .map(|kf| kf.get_covisibility_weight(kf_id))
+                        .unwrap_or(0);
+
+                    let new_weight = current_weight + 1;
+
+                    if let Some(kf) = self.keyframes.get_mut(&kf_id) {
+                        kf.add_covisibility(other_kf_id, new_weight);
+                    }
+                    if let Some(other_kf) = self.keyframes.get_mut(&other_kf_id) {
+                        other_kf.add_covisibility(kf_id, new_weight);
+                    }
+                }
+            }
+        }
+
+        // Update keeper's statistics
+        if let Some(keeper) = self.map_points.get_mut(&keeper_id) {
+            keeper.visible_count += goner_visible;
+            keeper.found_count += goner_found;
+        }
+
+        // Remove goner from map
+        if let Some(goner) = self.map_points.get_mut(&goner_id) {
+            goner.is_bad = true;
+            goner.observations.clear();
+        }
+        self.map_points.remove(&goner_id);
+
+        true
+    }
+
+    /// Compute the distinctive descriptor for a map point.
+    ///
+    /// The distinctive descriptor is the one with minimum maximum distance
+    /// to all other descriptors (the "median" descriptor).
+    ///
+    /// # Arguments
+    /// * `mp_id` - ID of the map point
+    ///
+    /// # Returns
+    /// `true` if descriptor was updated
+    pub fn compute_distinctive_descriptors(&mut self, mp_id: MapPointId) -> bool {
+        // Collect all descriptors from observing keyframes
+        let observations: Vec<(KeyFrameId, usize)> = self
+            .map_points
+            .get(&mp_id)
+            .map(|mp| mp.observations.iter().map(|(&k, &v)| (k, v)).collect())
+            .unwrap_or_default();
+
+        if observations.is_empty() {
+            return false;
+        }
+
+        // Get all descriptors
+        let mut descriptors = Vec::new();
+        for (kf_id, feat_idx) in &observations {
+            if let Some(kf) = self.keyframes.get(kf_id) {
+                if let Ok(row) = kf.descriptors.row(*feat_idx as i32) {
+                    if let Ok(desc) = row.try_clone() {
+                        descriptors.push(desc);
+                    }
+                }
+            }
+        }
+
+        if descriptors.is_empty() {
+            return false;
+        }
+
+        if descriptors.len() == 1 {
+            // Only one descriptor - use it directly
+            if let Some(mp) = self.map_points.get_mut(&mp_id) {
+                mp.descriptor = descriptors[0].try_clone().unwrap_or_default();
+            }
+            return true;
+        }
+
+        // Find descriptor with minimum maximum distance to others
+        // This is the "median" descriptor
+        let mut best_idx = 0;
+        let mut best_max_dist = u32::MAX;
+
+        for i in 0..descriptors.len() {
+            let mut max_dist = 0u32;
+            for j in 0..descriptors.len() {
+                if i != j {
+                    if let Ok(dist) =
+                        crate::tracking::frame::descriptor_distance(&descriptors[i], &descriptors[j])
+                    {
+                        max_dist = max_dist.max(dist);
+                    }
+                }
+            }
+            if max_dist < best_max_dist {
+                best_max_dist = max_dist;
+                best_idx = i;
+            }
+        }
+
+        // Update map point descriptor
+        if let Some(mp) = self.map_points.get_mut(&mp_id) {
+            mp.descriptor = descriptors[best_idx].try_clone().unwrap_or_default();
+        }
+
+        true
     }
 }
 

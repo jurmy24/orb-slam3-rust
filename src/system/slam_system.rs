@@ -10,8 +10,10 @@ use std::thread::{self, JoinHandle};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
 
+use crate::atlas::map::KeyFrameId;
 use crate::io::euroc::ImuEntry;
 use crate::local_mapping::LocalMapper;
+use crate::loop_closing::loop_closer::{spawn_loop_closer, LoopCloserConfig};
 use crate::tracking::Tracker;
 use crate::tracking::frame::{CameraModel, StereoFrame};
 use crate::tracking::result::TrackingResult;
@@ -24,7 +26,7 @@ use super::shared_state::SharedState;
 /// When the channel is full, Tracking will block briefly.
 const KEYFRAME_CHANNEL_CAPACITY: usize = 5;
 
-/// Main SLAM system orchestrating Tracking and Local Mapping.
+/// Main SLAM system orchestrating Tracking, Local Mapping, and Loop Closing.
 pub struct SlamSystem {
     /// Shared state (Atlas, flags) accessible by all threads.
     shared: Arc<SharedState>,
@@ -37,6 +39,9 @@ pub struct SlamSystem {
 
     /// Handle to the Local Mapping thread.
     local_mapping_handle: Option<JoinHandle<()>>,
+
+    /// Handle to the Loop Closing thread.
+    loop_closing_handle: Option<JoinHandle<()>>,
 }
 
 impl SlamSystem {
@@ -71,20 +76,33 @@ impl SlamSystem {
 
     /// Create a SLAM system with a pre-created shared state.
     fn with_shared_state(camera: CameraModel, shared: Arc<SharedState>) -> Result<Self> {
-        // Create bounded channel for keyframe communication
+        // Channel: Tracking -> LocalMapping
         let (kf_sender, kf_receiver) = bounded::<NewKeyFrameMsg>(KEYFRAME_CHANNEL_CAPACITY);
+
+        // Channel: LocalMapping -> LoopClosing
+        let (lc_sender, lc_receiver) = bounded::<KeyFrameId>(KEYFRAME_CHANNEL_CAPACITY);
 
         // Create the tracker
         let tracker = Tracker::new(camera, shared.clone(), kf_sender.clone())?;
 
-        // Spawn Local Mapping thread
-        let local_mapping_handle = Self::spawn_local_mapping(shared.clone(), kf_receiver, camera);
+        // Spawn Local Mapping thread (now with loop closer sender)
+        let local_mapping_handle =
+            Self::spawn_local_mapping(shared.clone(), kf_receiver, lc_sender, camera);
+
+        // Spawn Loop Closing thread
+        let loop_closing_handle = spawn_loop_closer(
+            shared.clone(),
+            lc_receiver,
+            camera,
+            LoopCloserConfig::default(),
+        );
 
         Ok(Self {
             shared,
             tracker,
             kf_sender,
             local_mapping_handle: Some(local_mapping_handle),
+            loop_closing_handle: Some(loop_closing_handle),
         })
     }
 
@@ -92,10 +110,11 @@ impl SlamSystem {
     fn spawn_local_mapping(
         shared: Arc<SharedState>,
         kf_receiver: Receiver<NewKeyFrameMsg>,
+        lc_sender: Sender<KeyFrameId>,
         camera: CameraModel,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
-            let mut local_mapper = LocalMapper::new(camera);
+            let mut local_mapper = LocalMapper::new(camera, Some(lc_sender));
             local_mapper.run(kf_receiver, shared);
         })
     }
@@ -124,20 +143,18 @@ impl SlamSystem {
 
     /// Shutdown the system gracefully.
     ///
-    /// Signals the Local Mapping thread to finish and waits for it.
+    /// Signals all threads to finish and waits for them.
     pub fn shutdown(&mut self) {
         // Signal shutdown
         self.shared.request_shutdown();
 
-        // Drop sender to unblock receiver (Local Mapping will exit its loop)
-        // Note: We can't drop self.kf_sender here since we don't own it exclusively.
-        // The thread will exit when it checks the shutdown flag.
-
         // Wait for Local Mapping to finish
         if let Some(handle) = self.local_mapping_handle.take() {
-            // Send a dummy message or let channel close naturally
-            // Actually, we need to signal somehow - the thread might be blocking on recv
-            // We'll handle this by having LocalMapper check shutdown periodically
+            let _ = handle.join();
+        }
+
+        // Wait for Loop Closing to finish
+        if let Some(handle) = self.loop_closing_handle.take() {
             let _ = handle.join();
         }
     }

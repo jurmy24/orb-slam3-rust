@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use opencv::core::Mat;
 use opencv::prelude::*;
 use tracing::{debug, info};
@@ -29,7 +29,8 @@ use crate::system::messages::NewKeyFrameMsg;
 use crate::system::shared_state::SharedState;
 use crate::tracking::frame::CameraModel;
 
-use super::imu_init::{apply_imu_init, initialize_imu};
+use super::imu_init::{apply_imu_init, check_sufficient_motion, initialize_imu};
+use super::search_in_neighbors::search_in_neighbors;
 use super::triangulation::{triangulate_from_neighbors as do_multiframe_triangulation, TriangulationConfig};
 
 /// Flow control threshold: if queue has more than this many keyframes,
@@ -43,12 +44,19 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 pub struct LocalMapper {
     /// Camera model for triangulation.
     camera: CameraModel,
+
+    /// Channel sender to Loop Closing thread.
+    lc_sender: Option<Sender<KeyFrameId>>,
 }
 
 impl LocalMapper {
     /// Create a new LocalMapper.
-    pub fn new(camera: CameraModel) -> Self {
-        Self { camera }
+    ///
+    /// # Arguments
+    /// * `camera` - Camera model for triangulation
+    /// * `lc_sender` - Optional sender to forward keyframe IDs to Loop Closing
+    pub fn new(camera: CameraModel, lc_sender: Option<Sender<KeyFrameId>>) -> Self {
+        Self { camera, lc_sender }
     }
 
     /// Main thread loop: receive keyframes and process them.
@@ -60,6 +68,16 @@ impl LocalMapper {
             // Check for shutdown
             if shared.is_shutdown_requested() {
                 break;
+            }
+
+            // Handle pause request from LoopCloser
+            if shared.should_pause_local_mapping() {
+                shared.set_local_mapping_paused(true);
+                while shared.should_pause_local_mapping() && !shared.is_shutdown_requested() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                shared.set_local_mapping_paused(false);
+                continue;
             }
 
             // Update flow control based on queue size
@@ -101,6 +119,10 @@ impl LocalMapper {
         // This creates additional map points by matching between neighbor keyframes
         self.triangulate_from_neighbors(kf_id, shared);
 
+        // Step 3c: Search in neighbors - fuse duplicate map points
+        // This merges map points between the current KF and its covisible neighbors
+        self.search_in_neighbors(kf_id, shared);
+
         // Step 4: Local Bundle Adjustment (LM-based)
         self.local_bundle_adjustment(kf_id, shared);
 
@@ -112,6 +134,11 @@ impl LocalMapper {
 
         // Step 7: Try to initialize IMU if not yet done
         self.try_imu_initialization(shared);
+
+        // Step 8: Send keyframe to Loop Closing (non-blocking)
+        if let Some(ref sender) = self.lc_sender {
+            let _ = sender.try_send(kf_id);
+        }
     }
 
     /// Attempt IMU initialization if conditions are met.
@@ -122,6 +149,12 @@ impl LocalMapper {
             if atlas.active_map().is_imu_initialized() {
                 return;
             }
+        }
+
+        // Check for sufficient motion (sets bad_imu flag if insufficient)
+        if !check_sufficient_motion(shared) {
+            // Insufficient motion detected - Tracker will handle map reset
+            return;
         }
 
         // Try to initialize
@@ -252,6 +285,30 @@ impl LocalMapper {
         let is_inertial = map.is_imu_initialized();
 
         let _result = do_multiframe_triangulation(map, kf_id, &self.camera, &config, is_inertial);
+    }
+
+    /// Search in neighbors: fuse duplicate map points between covisible keyframes.
+    ///
+    /// This function:
+    /// 1. Collects neighbor keyframes (covisible + temporal for inertial)
+    /// 2. Fuses current KF's map points into neighbors (adds observations or merges)
+    /// 3. Fuses neighbors' map points into current KF
+    /// 4. Updates affected points' descriptors and normals
+    ///
+    /// This reduces map point count and improves map consistency.
+    fn search_in_neighbors(&self, kf_id: KeyFrameId, shared: &Arc<SharedState>) {
+        let mut atlas = shared.atlas.write();
+        let map = atlas.active_map_mut();
+
+        let is_inertial = map.is_imu_initialized();
+        let result = search_in_neighbors(map, kf_id, &self.camera, is_inertial);
+
+        if result.num_fused > 0 || result.num_observations_added > 0 {
+            debug!(
+                "[SearchInNeighbors] kf={}: fused {} points, added {} observations",
+                kf_id.0, result.num_fused, result.num_observations_added
+            );
+        }
     }
 
     /// Local Bundle Adjustment using three-phase locking.

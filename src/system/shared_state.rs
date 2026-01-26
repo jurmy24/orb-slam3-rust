@@ -1,4 +1,4 @@
-//! Shared state between Tracking and Local Mapping threads.
+//! Shared state between Tracking, Local Mapping, and Loop Closing threads.
 //!
 //! The `SharedState` struct holds all data that needs to be accessed by
 //! multiple threads, protected by appropriate synchronization primitives.
@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use crate::atlas::atlas::Atlas;
 use crate::vocabulary::OrbVocabulary;
 
-/// Shared state accessible by both Tracking and Local Mapping threads.
+/// Shared state accessible by Tracking, Local Mapping, and Loop Closing threads.
 pub struct SharedState {
     /// The Atlas containing all maps, keyframes, and map points.
     /// Protected by RwLock: Tracking reads, Local Mapping writes.
@@ -31,6 +31,30 @@ pub struct SharedState {
 
     /// Request Local Mapping to finish processing and exit.
     pub shutdown_requested: AtomicBool,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Loop Closing coordination flags
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Request Local Mapping to pause (set by Loop Closing before correction).
+    pub pause_local_mapping: AtomicBool,
+
+    /// Acknowledgment that Local Mapping has paused.
+    pub local_mapping_paused: AtomicBool,
+
+    /// Flag indicating Global BA is currently running.
+    pub global_ba_running: AtomicBool,
+
+    /// Flag set when a loop has been corrected (for tracking to reset).
+    pub loop_corrected: AtomicBool,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // IMU initialization flags
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Flag indicating IMU initialization failed due to insufficient motion.
+    /// Set by Local Mapping when motion < 2cm over 10s. Tracker should reset map.
+    pub bad_imu: AtomicBool,
 }
 
 impl SharedState {
@@ -42,6 +66,11 @@ impl SharedState {
             stop_keyframe_creation: AtomicBool::new(false),
             abort_ba: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
+            pause_local_mapping: AtomicBool::new(false),
+            local_mapping_paused: AtomicBool::new(false),
+            global_ba_running: AtomicBool::new(false),
+            loop_corrected: AtomicBool::new(false),
+            bad_imu: AtomicBool::new(false),
         })
     }
 
@@ -53,6 +82,11 @@ impl SharedState {
             stop_keyframe_creation: AtomicBool::new(false),
             abort_ba: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
+            pause_local_mapping: AtomicBool::new(false),
+            local_mapping_paused: AtomicBool::new(false),
+            global_ba_running: AtomicBool::new(false),
+            loop_corrected: AtomicBool::new(false),
+            bad_imu: AtomicBool::new(false),
         })
     }
 
@@ -95,6 +129,49 @@ impl SharedState {
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Loop Closing coordination methods
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Check if Local Mapping should pause.
+    pub fn should_pause_local_mapping(&self) -> bool {
+        self.pause_local_mapping.load(Ordering::SeqCst)
+    }
+
+    /// Signal that Local Mapping has paused.
+    pub fn set_local_mapping_paused(&self, paused: bool) {
+        self.local_mapping_paused.store(paused, Ordering::SeqCst);
+    }
+
+    /// Check if Global BA is running.
+    pub fn is_global_ba_running(&self) -> bool {
+        self.global_ba_running.load(Ordering::SeqCst)
+    }
+
+    /// Check if a loop has been corrected (and tracking should reset).
+    pub fn check_and_clear_loop_corrected(&self) -> bool {
+        self.loop_corrected.swap(false, Ordering::SeqCst)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // IMU initialization methods
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Check if IMU initialization failed due to insufficient motion.
+    pub fn is_bad_imu(&self) -> bool {
+        self.bad_imu.load(Ordering::SeqCst)
+    }
+
+    /// Set the bad_imu flag (called by Local Mapping when insufficient motion detected).
+    pub fn set_bad_imu(&self, value: bool) {
+        self.bad_imu.store(value, Ordering::SeqCst);
+    }
+
+    /// Check and clear the bad_imu flag (returns true if it was set).
+    pub fn check_and_clear_bad_imu(&self) -> bool {
+        self.bad_imu.swap(false, Ordering::SeqCst)
+    }
 }
 
 impl Default for SharedState {
@@ -105,6 +182,11 @@ impl Default for SharedState {
             stop_keyframe_creation: AtomicBool::new(false),
             abort_ba: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
+            pause_local_mapping: AtomicBool::new(false),
+            local_mapping_paused: AtomicBool::new(false),
+            global_ba_running: AtomicBool::new(false),
+            loop_corrected: AtomicBool::new(false),
+            bad_imu: AtomicBool::new(false),
         }
     }
 }

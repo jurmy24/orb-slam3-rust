@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use nalgebra::Vector3;
 use opencv::core::{KeyPoint, Mat, Vector};
+use opencv::prelude::KeyPointTraitConst;
 
 use crate::geometry::SE3;
 use crate::imu::{ImuBias, PreintegratedState};
@@ -384,6 +385,64 @@ impl KeyFrame {
     /// Get number of features in this KeyFrame.
     pub fn num_features(&self) -> usize {
         self.keypoints.len()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Spatial Queries
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Get features within a radius around a point.
+    ///
+    /// Returns indices of keypoints within the specified radius of (u, v).
+    /// Optionally filters by ORB pyramid level.
+    ///
+    /// # Arguments
+    /// * `u` - X coordinate in image
+    /// * `v` - Y coordinate in image
+    /// * `radius` - Search radius in pixels
+    /// * `min_level` - Minimum ORB pyramid level (inclusive), or None for no minimum
+    /// * `max_level` - Maximum ORB pyramid level (inclusive), or None for no maximum
+    ///
+    /// # Returns
+    /// Vector of feature indices within the search area
+    pub fn get_features_in_area(
+        &self,
+        u: f64,
+        v: f64,
+        radius: f64,
+        min_level: Option<i32>,
+        max_level: Option<i32>,
+    ) -> Vec<usize> {
+        let mut indices = Vec::new();
+        let radius_sq = radius * radius;
+
+        for i in 0..self.keypoints.len() {
+            if let Ok(kp) = self.keypoints.get(i) {
+                // Check level bounds
+                let octave = kp.octave();
+                if let Some(min) = min_level {
+                    if octave < min {
+                        continue;
+                    }
+                }
+                if let Some(max) = max_level {
+                    if octave > max {
+                        continue;
+                    }
+                }
+
+                // Check distance
+                let du = kp.pt().x as f64 - u;
+                let dv = kp.pt().y as f64 - v;
+                let dist_sq = du * du + dv * dv;
+
+                if dist_sq <= radius_sq {
+                    indices.push(i);
+                }
+            }
+        }
+
+        indices
     }
 }
 

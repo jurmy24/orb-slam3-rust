@@ -17,7 +17,7 @@ use nalgebra::Vector3;
 use opencv::core::{Mat, Point2f, Vector};
 use opencv::features2d::BFMatcher;
 use opencv::prelude::*;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::atlas::keyframe_db::BowVector;
 use crate::atlas::map::{KeyFrameId, MapPointId};
@@ -175,6 +175,12 @@ impl Tracker {
             rotation: pred_rot,
             translation: pred_pos,
         };
+
+        // Check for bad_imu flag (insufficient motion detected by Local Mapping)
+        if self.shared.check_and_clear_bad_imu() {
+            warn!("Bad IMU detected - insufficient motion for initialization. Resetting map.");
+            self.reset_for_bad_imu()?;
+        }
 
         // --- Map initialization or tracking ---
         let n_inliers: usize;
@@ -570,6 +576,35 @@ impl Tracker {
         self.kf_decision.reset();
         self.kf_preintegrator.reset();
         self.clear_motion_model();
+
+        Ok(())
+    }
+
+    /// Reset the map due to bad IMU (insufficient motion detected).
+    ///
+    /// This is triggered when the camera has been stationary for too long
+    /// and IMU initialization cannot succeed.
+    fn reset_for_bad_imu(&mut self) -> Result<()> {
+        // Always reset current map for bad_imu (don't preserve - it's corrupted)
+        {
+            let mut atlas = self.shared.atlas.write();
+            atlas.reset_active_map();
+        }
+
+        // Reset tracker state
+        self.reference_kf = None;
+        self.reference_kf_num_points = 0;
+        self.state = TrackingState::NotInitialized;
+        self.lost_frames = 0;
+        self.time_stamp_lost = None;
+        self.kf_decision.reset();
+        self.kf_preintegrator.reset();
+        self.preintegrator.reset();
+        self.clear_motion_model();
+
+        // Reset pose and velocity
+        self.pose = SE3::identity();
+        self.velocity = Vector3::zeros();
 
         Ok(())
     }
